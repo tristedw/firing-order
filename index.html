@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Firing Order | engine simulator</title>
+    <meta name="description" content="A 3D engine you can tune. Pistons, crank, cams and valves driven by a crank angle combustion model, with a spark table, dyno and knock." />
+    <meta name="theme-color" content="#dfe4e8" />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <header class="bar">
+      <a class="brand" href="./" aria-label="Firing Order home">
+        <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
+          <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="2.4" />
+          <circle cx="16" cy="9.5" r="3.6" fill="var(--spark)" />
+          <path d="M16 16 L16 9.5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" />
+          <circle cx="16" cy="16" r="2.4" fill="currentColor" />
+        </svg>
+        <span>Firing Order</span>
+      </a>
+
+      <label class="preset">
+        <span class="sr-only">Engine preset</span>
+        <select id="preset" class="select"></select>
+      </label>
+
+      <div class="key">
+        <button id="start" class="btn btn-go" type="button">Start engine</button>
+        <span id="status" class="status" aria-live="polite">Off</span>
+      </div>
+
+      <div class="bar-right">
+        <div class="seg" role="group" aria-label="Units">
+          <button type="button" data-units="imperial" aria-pressed="true">lb-ft, hp</button>
+          <button type="button" data-units="metric" aria-pressed="false">Nm, kW</button>
+        </div>
+        <button id="sound" class="btn btn-quiet" type="button" aria-pressed="true">Sound on</button>
+        <button id="share" class="btn btn-quiet" type="button">Copy tune link</button>
+        <button id="help" class="btn btn-quiet btn-icon" type="button" aria-label="Keyboard shortcuts" aria-expanded="false">?</button>
+      </div>
+    </header>
+
+    <main class="bench">
+      <aside class="tune" id="tune" aria-label="Tune"></aside>
+
+      <section class="stage" aria-label="Engine view">
+        <canvas id="gl"></canvas>
+
+        <div class="ring-card">
+          <canvas id="ring" width="210" height="210" aria-label="Valve timing for the watched cylinder"></canvas>
+          <div class="ring-legend">
+            <span><i class="sw sw-charge"></i>Intake open</span>
+            <span><i class="sw sw-exhaust"></i>Exhaust open</span>
+            <span><i class="sw sw-spark"></i>Spark</span>
+            <span><i class="sw sw-heat"></i>Burn</span>
+          </div>
+        </div>
+
+        <div class="firing" id="firing"></div>
+
+        <div class="inspector" id="inspector" hidden>
+          <div class="insp-head">
+            <h2 id="insp-title">Part</h2>
+            <button class="btn btn-quiet btn-icon" id="insp-close" type="button" aria-label="Close part details">×</button>
+          </div>
+          <p class="insp-desc" id="insp-desc"></p>
+          <dl class="insp-data" id="insp-data"></dl>
+        </div>
+
+        <div class="failure" id="failure" hidden role="alert">
+          <p id="failure-text"></p>
+          <button class="btn btn-go" id="rebuild" type="button">Rebuild engine</button>
+        </div>
+
+        <div class="stage-tools">
+          <div class="seg" role="group" aria-label="Time scale">
+            <button type="button" data-speed="1" aria-pressed="true">Real time</button>
+            <button type="button" data-speed="0.25">¼</button>
+            <button type="button" data-speed="0.04">1/25</button>
+            <button type="button" data-speed="0.005">1/200</button>
+            <button type="button" data-speed="0">Pause</button>
+          </div>
+          <div class="seg" role="group" aria-label="Block">
+            <button type="button" data-block="ghost" aria-pressed="true">Ghost block</button>
+            <button type="button" data-block="solid">Solid</button>
+            <button type="button" data-block="hidden">Bare</button>
+          </div>
+          <div class="seg" role="group" aria-label="Camera">
+            <button type="button" data-view="iso">3/4</button>
+            <button type="button" data-view="front">Front</button>
+            <button type="button" data-view="side">Side</button>
+            <button type="button" data-view="top">Top</button>
+          </div>
+        </div>
+
+        <p class="stage-hint" id="stage-hint">Click any part to inspect it. With the engine off, drag the crank or flywheel to turn it over by hand.</p>
+      </section>
+
+      <aside class="gauges" aria-label="Gauges">
+        <canvas id="tach" class="tach" aria-label="Tachometer"></canvas>
+        <dl class="readouts" id="readouts"></dl>
+        <div class="cyl-strip">
+          <h3>Cylinders</h3>
+          <p class="hint">Click to watch one. Cut drops its spark.</p>
+          <div id="cyls" class="cyls"></div>
+        </div>
+        <div class="toggles">
+          <label class="check"><input type="checkbox" id="knockctl" checked /> Knock control</label>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="deck">
+      <div class="pedals">
+        <div class="pedal">
+          <div class="field-top">
+            <label for="throttle" class="field-label">Throttle</label>
+            <output id="throttle-out" class="num-out">0%</output>
+          </div>
+          <input id="throttle" type="range" min="0" max="100" step="1" value="0" />
+          <p class="hint">Hold W for wide open.</p>
+        </div>
+        <div class="pedal">
+          <div class="field-top">
+            <label for="load" class="field-label">Load</label>
+            <output id="load-out" class="num-out">0%</output>
+          </div>
+          <input id="load" type="range" min="0" max="100" step="1" value="0" />
+          <p class="hint">Brake torque on the crank, like a hill.</p>
+        </div>
+      </div>
+
+      <figure class="chart">
+        <figcaption>
+          <span>Pressure vs volume</span>
+          <button id="pvlog" class="btn btn-quiet btn-small" type="button" aria-pressed="true">Log scale</button>
+        </figcaption>
+        <canvas id="pv"></canvas>
+      </figure>
+
+      <figure class="chart">
+        <figcaption><span>Pressure vs crank angle</span><span class="cap-note" id="pt-note"></span></figcaption>
+        <canvas id="pt"></canvas>
+      </figure>
+
+      <figure class="chart chart-dyno">
+        <figcaption>
+          <span>Dyno <span class="cap-note"><i class="sw sw-ink"></i>torque <i class="sw sw-heat"></i>power</span></span>
+          <span class="dyno-btns">
+            <button id="dyno" class="btn btn-quiet btn-small" type="button">Run a pull</button>
+            <button id="dyno-clear" class="btn btn-quiet btn-small" type="button">Clear</button>
+          </span>
+        </figcaption>
+        <canvas id="dynoc"></canvas>
+        <p class="dyno-peak" id="dyno-peak"></p>
+      </figure>
+    </footer>
+
+    <div class="help" id="helpbox" hidden>
+      <h2>Keys</h2>
+      <dl>
+        <dt>Space</dt><dd>Start or stop</dd>
+        <dt>W</dt><dd>Full throttle while held</dd>
+        <dt>1 to 8</dt><dd>Watch a cylinder</dd>
+        <dt>P</dt><dd>Pause</dd>
+        <dt>S</dt><dd>Cycle slow motion</dd>
+        <dt>B</dt><dd>Cycle block view</dd>
+        <dt>D</dt><dd>Run a dyno pull</dd>
+        <dt>Esc</dt><dd>Close part details</dd>
+      </dl>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

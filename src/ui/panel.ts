@@ -1,0 +1,451 @@
+import { LAYOUTS, type LayoutId } from '../sim/layouts';
+import { SPARK_MAP, SPARK_RPM, makeSpark, type Tune } from '../sim/tune';
+
+type NumKey = { [K in keyof Tune]: Tune[K] extends number ? K : never }[keyof Tune];
+
+interface Field {
+  key: NumKey;
+  label: string;
+  unit: string;
+  min: number;
+  max: number;
+  step: number;
+  hint?: string;
+  geometry?: boolean;
+}
+
+export const GEOMETRY_KEYS = new Set<keyof Tune>(['layout', 'bore', 'stroke', 'rod', 'compression', 'inDuration', 'exDuration', 'inLift', 'exLift']);
+
+const GROUPS: { id: string; name: string; fields: Field[] }[] = [
+  {
+    id: 'engine',
+    name: 'Bottom end',
+    fields: [
+      { key: 'bore', label: 'Bore', unit: 'mm', min: 50, max: 115, step: 0.1 },
+      { key: 'stroke', label: 'Stroke', unit: 'mm', min: 40, max: 120, step: 0.1 },
+      { key: 'rod', label: 'Rod length', unit: 'mm', min: 80, max: 200, step: 0.5, hint: 'Center to center. Longer rods mean less side load and a gentler piston dwell at TDC.' },
+      { key: 'compression', label: 'Compression', unit: ':1', min: 6, max: 15, step: 0.1 },
+      { key: 'recipMass', label: 'Piston and pin mass', unit: 'g', min: 120, max: 1000, step: 5, hint: 'Sets rod load. Heavy parts break rods at lower rpm.' },
+      { key: 'flywheel', label: 'Flywheel', unit: '×', min: 0.3, max: 3, step: 0.05, hint: 'Rotating inertia. Light revs fast, heavy idles smooth.' },
+    ],
+  },
+  {
+    id: 'cam',
+    name: 'Camshaft',
+    fields: [
+      { key: 'inDuration', label: 'Intake duration', unit: '°', min: 180, max: 320, step: 1 },
+      { key: 'exDuration', label: 'Exhaust duration', unit: '°', min: 180, max: 320, step: 1 },
+      { key: 'inCenterline', label: 'Intake centerline', unit: '° ATDC', min: 90, max: 130, step: 0.5, hint: 'Lower numbers advance the cam: torque moves down the rev range.' },
+      { key: 'exCenterline', label: 'Exhaust centerline', unit: '° BTDC', min: 90, max: 130, step: 0.5 },
+      { key: 'inLift', label: 'Intake lift', unit: 'mm', min: 4, max: 17, step: 0.1 },
+      { key: 'exLift', label: 'Exhaust lift', unit: 'mm', min: 4, max: 17, step: 0.1 },
+      { key: 'springRate', label: 'Valve springs', unit: '×', min: 0.6, max: 2, step: 0.05, hint: 'Stiffer springs push valve float higher.' },
+    ],
+  },
+  {
+    id: 'fuel',
+    name: 'Fuel and air',
+    fields: [
+      { key: 'afrCruise', label: 'AFR at part throttle', unit: ':1', min: 10, max: 18, step: 0.1 },
+      { key: 'afrWot', label: 'AFR at full throttle', unit: ':1', min: 10, max: 18, step: 0.1, hint: 'Best power is a bit rich, around 12.5 to 13.' },
+      { key: 'octane', label: 'Fuel octane', unit: 'AKI', min: 80, max: 110, step: 1 },
+      { key: 'runner', label: 'Intake runner', unit: 'mm', min: 100, max: 600, step: 5 },
+      { key: 'boost', label: 'Turbo boost', unit: 'psi', min: 0, max: 30, step: 0.5, hint: '0 for naturally aspirated.' },
+    ],
+  },
+  {
+    id: 'limits',
+    name: 'Limits',
+    fields: [
+      { key: 'revLimit', label: 'Rev limiter', unit: 'rpm', min: 2000, max: 12000, step: 50 },
+      { key: 'idleRpm', label: 'Idle target', unit: 'rpm', min: 500, max: 2000, step: 10 },
+      { key: 'rodStrength', label: 'Rod strength', unit: 'kN', min: 4, max: 60, step: 0.5, hint: 'How much inertial pull the rods take before one snaps. Forged rods buy you rpm.' },
+    ],
+  },
+];
+
+export interface PanelHooks {
+  onChange(key: keyof Tune): void;
+  getLive(): { rpm: number; map: number };
+}
+
+export class TunePanel {
+  private inputs = new Map<NumKey, { num: HTMLInputElement; range: HTMLInputElement }>();
+  private layoutSel!: HTMLSelectElement;
+  private derived = new Map<string, HTMLElement>();
+  private cells: HTMLElement[][] = [];
+  private sel = { r0: 0, c0: 0, r1: 0, c1: 0, active: false };
+  private lastCursor: HTMLElement | null = null;
+  activeTab = 'engine';
+
+  constructor(
+    private host: HTMLElement,
+    private tune: () => Tune,
+    private hooks: PanelHooks,
+  ) {
+    this.render();
+  }
+
+  private render() {
+    const tabs = [
+      ...GROUPS.slice(0, 2).map((g) => ({ id: g.id, name: g.name })),
+      { id: 'spark', name: 'Spark' },
+      ...GROUPS.slice(2).map((g) => ({ id: g.id, name: g.name })),
+    ];
+    this.host.innerHTML = '';
+    const nav = el('div', 'tabs');
+    nav.setAttribute('role', 'tablist');
+    tabs.forEach((t) => {
+      const b = el('button', 'tab') as HTMLButtonElement;
+      b.textContent = t.name;
+      b.setAttribute('role', 'tab');
+      b.dataset.tab = t.id;
+      b.onclick = () => this.show(t.id);
+      nav.append(b);
+    });
+    this.host.append(nav);
+
+    const body = el('div', 'tab-body');
+    this.host.append(body);
+
+    for (const g of GROUPS) {
+      const sec = el('section', 'pane');
+      sec.dataset.pane = g.id;
+      if (g.id === 'engine') sec.append(this.layoutRow());
+      for (const f of g.fields) sec.append(this.fieldRow(f));
+      sec.append(this.derivedBlock(g.id));
+      body.append(sec);
+    }
+    body.append(this.sparkPane());
+    this.show(this.activeTab);
+    this.sync();
+  }
+
+  show(id: string) {
+    this.activeTab = id;
+    this.host.querySelectorAll<HTMLElement>('.tab').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === id)));
+    this.host.querySelectorAll<HTMLElement>('.pane').forEach((p) => (p.hidden = p.dataset.pane !== id));
+  }
+
+  private layoutRow() {
+    const row = el('label', 'field');
+    const top = el('span', 'field-top');
+    top.append(text('span', 'field-label', 'Layout'));
+    row.append(top);
+    const s = document.createElement('select');
+    s.className = 'select';
+    for (const l of Object.values(LAYOUTS)) {
+      const o = document.createElement('option');
+      o.value = l.id;
+      o.textContent = l.name;
+      s.append(o);
+    }
+    s.onchange = () => {
+      this.tune().layout = s.value as LayoutId;
+      this.hooks.onChange('layout');
+      this.sync();
+    };
+    this.layoutSel = s;
+    row.append(s);
+    return row;
+  }
+
+  private fieldRow(f: Field) {
+    const row = el('div', 'field');
+    const top = el('div', 'field-top');
+    const id = `f-${f.key}`;
+    const lab = text('label', 'field-label', f.label) as HTMLLabelElement;
+    lab.htmlFor = id;
+    const numWrap = el('span', 'num');
+    const num = document.createElement('input');
+    num.type = 'number';
+    num.id = id;
+    num.min = String(f.min);
+    num.max = String(f.max);
+    num.step = String(f.step);
+    numWrap.append(num, text('span', 'unit', f.unit));
+    top.append(lab, numWrap);
+    const range = document.createElement('input');
+    range.type = 'range';
+    range.min = String(f.min);
+    range.max = String(f.max);
+    range.step = String(f.step);
+    range.setAttribute('aria-label', f.label);
+    const apply = (v: number) => {
+      if (!Number.isFinite(v)) return;
+      v = Math.min(f.max, Math.max(f.min, v));
+      (this.tune() as unknown as Record<string, number>)[f.key] = v;
+      this.hooks.onChange(f.key);
+      this.sync();
+    };
+    range.oninput = () => apply(+range.value);
+    num.onchange = () => apply(+num.value);
+    row.append(top, range);
+    if (f.hint) row.append(text('p', 'hint', f.hint));
+    this.inputs.set(f.key, { num, range });
+    return row;
+  }
+
+  private derivedBlock(group: string) {
+    const d = el('dl', 'derived');
+    const add = (k: string, label: string) => {
+      const dt = text('dt', '', label);
+      const dd = el('dd', '');
+      d.append(dt, dd);
+      this.derived.set(k, dd);
+    };
+    if (group === 'engine') {
+      add('disp', 'Displacement');
+      add('rs', 'Rod to stroke');
+      add('ps', 'Piston speed at limiter');
+    } else if (group === 'cam') {
+      add('lsa', 'Lobe separation');
+      add('overlap', 'Overlap');
+      add('ivc', 'Intake closes');
+      add('float', 'Valve float');
+    } else if (group === 'fuel') {
+      add('lambda', 'Lambda at full throttle');
+      add('tuned', 'Runner tuned for');
+    } else if (group === 'limits') {
+      add('rodlim', 'Rods let go near');
+      add('float2', 'Valve float');
+    }
+    return d;
+  }
+
+  private sparkPane() {
+    const sec = el('section', 'pane');
+    sec.dataset.pane = 'spark';
+    sec.append(text('p', 'hint', 'Ignition advance in degrees before TDC. Rows are manifold pressure, columns are rpm. The outlined cell is where the engine is running right now.'));
+    const wrap = el('div', 'spark-wrap');
+    const table = el('div', 'spark-table');
+    table.style.gridTemplateColumns = `auto repeat(${SPARK_RPM.length}, 1fr)`;
+    table.tabIndex = 0;
+    table.setAttribute('aria-label', 'Spark advance table');
+    table.append(text('span', 'corner', 'kPa'));
+    SPARK_RPM.forEach((r) => table.append(text('span', 'axis', r >= 1000 ? `${r / 1000}k` : String(r))));
+    this.cells = [];
+    for (let mi = SPARK_MAP.length - 1; mi >= 0; mi--) {
+      table.append(text('span', 'axis axis-row', String(SPARK_MAP[mi])));
+      const row: HTMLElement[] = [];
+      SPARK_RPM.forEach((_, ri) => {
+        const c = el('span', 'cell');
+        c.dataset.m = String(mi);
+        c.dataset.r = String(ri);
+        c.onpointerdown = (ev) => {
+          ev.preventDefault();
+          table.focus();
+          if (ev.shiftKey && this.sel.active) {
+            this.sel.r1 = mi;
+            this.sel.c1 = ri;
+          } else {
+            this.sel = { r0: mi, c0: ri, r1: mi, c1: ri, active: true };
+          }
+          this.paintSel();
+          const move = (e2: PointerEvent) => {
+            const t = document.elementFromPoint(e2.clientX, e2.clientY) as HTMLElement | null;
+            if (t?.classList.contains('cell')) {
+              this.sel.r1 = +t.dataset.m!;
+              this.sel.c1 = +t.dataset.r!;
+              this.paintSel();
+            }
+          };
+          const up = () => {
+            window.removeEventListener('pointermove', move);
+            window.removeEventListener('pointerup', up);
+          };
+          window.addEventListener('pointermove', move);
+          window.addEventListener('pointerup', up);
+        };
+        row.push(c);
+        table.append(c);
+      });
+      this.cells[mi] = row;
+    }
+    table.onkeydown = (ev) => {
+      if (ev.key === '+' || ev.key === '=' || ev.key === 'PageUp') this.bump(ev.shiftKey ? 0.5 : 1);
+      else if (ev.key === '-' || ev.key === '_' || ev.key === 'PageDown') this.bump(ev.shiftKey ? -0.5 : -1);
+      else if (ev.key.startsWith('Arrow')) {
+        const dm = ev.key === 'ArrowUp' ? 1 : ev.key === 'ArrowDown' ? -1 : 0;
+        const dr = ev.key === 'ArrowRight' ? 1 : ev.key === 'ArrowLeft' ? -1 : 0;
+        const m = clampI(this.sel.r1 + dm, 0, SPARK_MAP.length - 1);
+        const r = clampI(this.sel.c1 + dr, 0, SPARK_RPM.length - 1);
+        if (ev.shiftKey) {
+          this.sel.r1 = m;
+          this.sel.c1 = r;
+        } else this.sel = { r0: m, c0: r, r1: m, c1: r, active: true };
+        this.paintSel();
+      } else return;
+      ev.preventDefault();
+      ev.stopPropagation();
+    };
+    wrap.append(table);
+    sec.append(wrap);
+
+    const tools = el('div', 'spark-tools');
+    const btn = (label: string, fn: () => void, title?: string) => {
+      const b = text('button', 'btn btn-quiet', label) as HTMLButtonElement;
+      if (title) b.title = title;
+      b.onclick = fn;
+      tools.append(b);
+    };
+    btn('Advance 1°', () => this.bump(1), 'Plus key');
+    btn('Retard 1°', () => this.bump(-1), 'Minus key');
+    btn('Smooth', () => this.smooth());
+    btn('Select all', () => {
+      this.sel = { r0: 0, c0: 0, r1: SPARK_MAP.length - 1, c1: SPARK_RPM.length - 1, active: true };
+      this.paintSel();
+    });
+    btn('Flatten to 20°', () => {
+      this.tune().spark = makeSpark(20, 20, 0);
+      this.hooks.onChange('spark');
+      this.sync();
+    }, 'Good starting point for finding MBT by hand');
+    sec.append(tools);
+    sec.append(text('p', 'hint', 'Click or drag to select cells, shift click to extend, then use plus and minus. Too much advance on low octane will knock.'));
+    return sec;
+  }
+
+  private range() {
+    const s = this.sel;
+    return {
+      m0: Math.min(s.r0, s.r1),
+      m1: Math.max(s.r0, s.r1),
+      c0: Math.min(s.c0, s.c1),
+      c1: Math.max(s.c0, s.c1),
+    };
+  }
+
+  private bump(d: number) {
+    if (!this.sel.active) return;
+    const { m0, m1, c0, c1 } = this.range();
+    const sp = this.tune().spark;
+    for (let m = m0; m <= m1; m++) for (let c = c0; c <= c1; c++) sp[m][c] = Math.max(-10, Math.min(60, Math.round((sp[m][c] + d) * 2) / 2));
+    this.hooks.onChange('spark');
+    this.paintCells();
+  }
+
+  private smooth() {
+    const sp = this.tune().spark;
+    const src = sp.map((r) => [...r]);
+    const { m0, m1, c0, c1 } = this.sel.active ? this.range() : { m0: 0, m1: SPARK_MAP.length - 1, c0: 0, c1: SPARK_RPM.length - 1 };
+    for (let m = m0; m <= m1; m++)
+      for (let c = c0; c <= c1; c++) {
+        let sum = 0;
+        let n = 0;
+        for (let dm = -1; dm <= 1; dm++)
+          for (let dc = -1; dc <= 1; dc++) {
+            const v = src[m + dm]?.[c + dc];
+            if (v !== undefined) {
+              sum += v;
+              n++;
+            }
+          }
+        sp[m][c] = Math.round((sum / n) * 2) / 2;
+      }
+    this.hooks.onChange('spark');
+    this.paintCells();
+  }
+
+  private paintSel() {
+    const { m0, m1, c0, c1 } = this.range();
+    this.cells.forEach((row, m) => row.forEach((c, r) => c.classList.toggle('sel', this.sel.active && m >= m0 && m <= m1 && r >= c0 && r <= c1)));
+  }
+
+  private paintCells() {
+    const sp = this.tune().spark;
+    this.cells.forEach((row, m) =>
+      row.forEach((c, r) => {
+        const v = sp[m][r];
+        c.textContent = Number.isInteger(v) ? String(v) : v.toFixed(1);
+        // cool steel for little advance, ignition amber for a lot
+        const t = Math.max(0, Math.min(1, (v - 5) / 40));
+        c.style.setProperty('--t', t.toFixed(3));
+      }),
+    );
+  }
+
+  // live cursor on the spark table
+  tick() {
+    if (this.activeTab !== 'spark') return;
+    const { rpm, map } = this.hooks.getLive();
+    let ri = 0;
+    let best = Infinity;
+    SPARK_RPM.forEach((r, i) => {
+      if (Math.abs(r - rpm) < best) {
+        best = Math.abs(r - rpm);
+        ri = i;
+      }
+    });
+    let mi = 0;
+    best = Infinity;
+    SPARK_MAP.forEach((m, i) => {
+      if (Math.abs(m - map) < best) {
+        best = Math.abs(m - map);
+        mi = i;
+      }
+    });
+    const c = this.cells[mi]?.[ri] ?? null;
+    if (c !== this.lastCursor) {
+      this.lastCursor?.classList.remove('live');
+      c?.classList.add('live');
+      this.lastCursor = c;
+    }
+  }
+
+  sync() {
+    const t = this.tune();
+    this.layoutSel.value = t.layout;
+    for (const [k, { num, range }] of this.inputs) {
+      const v = t[k] as number;
+      if (document.activeElement !== num) num.value = String(+v.toFixed(2));
+      range.value = String(v);
+      range.style.setProperty('--fill', `${((v - +range.min) / (+range.max - +range.min)) * 100}%`);
+    }
+    this.paintCells();
+    this.paintSel();
+    this.updateDerived();
+  }
+
+  updateDerived(extra?: { floatRpm: number; rodRpm: number }) {
+    const t = this.tune();
+    const n = LAYOUTS[t.layout].cyls.length;
+    const disp = (Math.PI / 4) * (t.bore / 10) ** 2 * (t.stroke / 10) * n;
+    const set = (k: string, v: string) => {
+      const e = this.derived.get(k);
+      if (e) e.textContent = v;
+    };
+    set('disp', `${(disp / 1000).toFixed(2)} L, ${Math.round(disp / 16.387)} ci`);
+    set('rs', (t.rod / t.stroke).toFixed(2));
+    set('ps', `${((2 * t.stroke * t.revLimit) / 60000).toFixed(1)} m/s`);
+    const lsa = (t.inCenterline + t.exCenterline) / 2;
+    set('lsa', `${lsa.toFixed(1)}°`);
+    const ivo = t.inCenterline - t.inDuration / 2; // ATDC, negative means BTDC
+    const evc = 720 - t.exCenterline + t.exDuration / 2 - 720;
+    const overlap = Math.max(0, evc - ivo);
+    set('overlap', `${overlap.toFixed(0)}°`);
+    const ivc = t.inCenterline + t.inDuration / 2 - 180;
+    set('ivc', `${ivc.toFixed(0)}° ABDC`);
+    set('lambda', (t.afrWot / 14.7).toFixed(2));
+    set('tuned', `${Math.round(1.9e6 / t.runner / 50) * 50} rpm`);
+    if (extra) {
+      set('float', `${Math.round(extra.floatRpm / 10) * 10} rpm`);
+      set('float2', `${Math.round(extra.floatRpm / 10) * 10} rpm`);
+      set('rodlim', `${Math.round(extra.rodRpm / 10) * 10} rpm`);
+    }
+  }
+}
+
+function el(tag: string, cls: string) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  return e;
+}
+function text(tag: string, cls: string, t: string) {
+  const e = el(tag, cls);
+  e.textContent = t;
+  return e;
+}
+function clampI(v: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, v));
+}
