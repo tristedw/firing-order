@@ -524,26 +524,6 @@ export function buildTurboKit(o: TurboKitIn): TurboKit {
     bov.position.copy(at).add(new THREE.Vector3(0, pR * 0.8, 0));
     kit.add(bov);
   }
-  // air filter cone on the compressor inlet
-  const mouthK = toKit(new THREE.Vector3(mouth - ind * 0.05, 0, 0));
-  const inAxis = dirKit(new THREE.Vector3(-1, 0, 0));
-  const filter = lathe(
-    [
-      [ind * 0.6, 0],
-      [ind * 0.62, ind * 0.12],
-      [ind * 0.95, ind * 0.2],
-      [ind * 0.78, ind * 1.3],
-      [ind * 0.8, ind * 1.36],
-      [0.001, ind * 1.4],
-    ],
-    new THREE.MeshStandardMaterial({ color: 0x3a3a3c, roughness: 0.95, metalness: 0, map: pleatTexture() }),
-    40,
-  );
-  // lathe axis is +x, aim it along the inlet
-  filter.quaternion.setFromUnitVectors(X, inAxis);
-  filter.position.copy(mouthK);
-  kit.add(filter);
-
   kit.traverse((c) => {
     if ((c as THREE.Mesh).isMesh) c.castShadow = true;
   });
@@ -565,21 +545,4 @@ function finTexture() {
   finTex.wrapS = finTex.wrapT = THREE.RepeatWrapping;
   finTex.repeat.set(1, 3);
   return finTex;
-}
-
-let pleatTex: THREE.Texture | null = null;
-function pleatTexture() {
-  if (pleatTex) return pleatTex;
-  const c = document.createElement('canvas');
-  c.width = 256;
-  c.height = 16;
-  const g = c.getContext('2d')!;
-  for (let x = 0; x < 256; x++) {
-    const v = 40 + 30 * (0.5 + 0.5 * Math.sin((x / 256) * Math.PI * 2 * 24));
-    g.fillStyle = `rgb(${v},${v},${v + 3})`;
-    g.fillRect(x, 0, 1, 16);
-  }
-  pleatTex = new THREE.CanvasTexture(c);
-  pleatTex.wrapS = THREE.RepeatWrapping;
-  return pleatTex;
 }

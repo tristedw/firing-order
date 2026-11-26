@@ -521,8 +521,16 @@ export class Engine {
   }
 
   // Advance the sim by dt seconds of engine time
+  // pressure signals for the sound, one value per sim step with its length in seconds.
+  // a: left bank header, b: right bank header, c: intake runners
+  audio = { dt: [] as number[], a: [] as number[], b: [] as number[], c: [] as number[] };
+
   update(dt: number) {
     this.events.length = 0;
+    this.audio.dt.length = 0;
+    this.audio.a.length = 0;
+    this.audio.b.length = 0;
+    this.audio.c.length = 0;
     const t = this.tune;
     let left = dt;
     let elapsed = 0;
@@ -657,7 +665,7 @@ export class Engine {
       this.surging = !t.bov && pr0 > 1.25 && flowFrac < surgeLine && this.throttle < 0.25;
       // inertia of the wheel, a big turbo takes a while to wake up
       const tau = 0.45 * Math.pow(size, 2.4) / clamp(drive / need, 0.35, 2);
-      const fall = this.surging ? 3 : this.bovOpen ? 1.6 : 1;
+      const fall = this.surging ? 1.3 : this.bovOpen ? 1.6 : 1;
       this.spool += (target - this.spool) * Math.min(1, (h * (target < this.spool ? fall : 1)) / tau);
       this.spool = clamp(this.spool, 0, 1.3);
       let boostPa = PATM * prMax * this.spool * this.spool;
@@ -737,6 +745,9 @@ export class Engine {
     let mdotIntakeSum = 0;
     let mdotExhSum = 0;
     let torque = 0;
+    let sndA = 0;
+    let sndB = 0;
+    let sndC = 0;
     const thetaPrev = this.theta;
     const dTheta = (omega * h) / DEG; // shaft deg
     const dThetaN = dTheta * this.kN; // normalised cycle deg
@@ -968,12 +979,30 @@ export class Engine {
       mdotIntakeSum += mi;
       mdotExhSum += me;
 
+      // what the pipes hear. gas pushed through a valve launches a pressure wave down the
+      // pipe of rho c u, which is c times mass flow over pipe area. blowdown, overlap
+      // reversion, a cylinder that never lit, all of it shows up here
+      {
+        const aP = rot ? this.portExMax * 1.3 : Math.PI * (0.65 * this.dEx) ** 2;
+        const aI = rot ? this.portInMax * 1.2 : Math.PI * (0.6 * this.dIn) ** 2;
+        const cHot = Math.sqrt(1.33 * R * Math.max(500, T));
+        const sig = (cHot * me) / aP;
+        if (this.layout.cyls[c.idx].bank > 0) sndB += sig;
+        else sndA += sig;
+        sndC -= (343 * mi) / aI;
+      }
+
       if (c.idx === this.watch) {
         const k = Math.floor(cyc) % 720;
         this.traceLive.p[k] = c.p;
         this.traceLive.V[k] = c.V;
       }
     }
+
+    this.audio.dt.push(h);
+    this.audio.a.push(sndA);
+    this.audio.b.push(this.layout.cyls.some((cd) => cd.bank > 0) ? sndB : sndA);
+    this.audio.c.push(sndC);
 
     // manifold filling and emptying
     this.pMan += ((R * Tup) / this.Vman) * (mdotThr - mdotIntakeSum) * h;

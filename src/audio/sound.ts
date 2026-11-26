@@ -1,7 +1,9 @@
-// Engine sound. The engine itself is a waveguide model on the audio thread
-// (engine-worklet.ts): real pipe lengths, cam timing as valve reflections, one
-// blowdown per cylinder sized by the sim. This side adds what isn't the engine
-// breathing: turbo whine, BOV, surge, knock ping, the starter, a bit of room.
+// Engine sound. The sim streams header and intake runner pressure at its step rate,
+// the audio thread turns that into flow noise (engine-worklet.ts), and a recorded
+// exhaust impulse response from engine-sim (ange-yaghi/engine-sim, MIT, see
+// public/audio) supplies the pipes and muffler. So every misfire, lope and reversion
+// spike in the sim is what you hear. This side adds turbo whine, BOV, surge, knock
+// ping, the starter and a bit of room.
 
 import type { Engine, Readings } from '../sim/engine';
 import workletUrl from './engine-worklet.ts?worker&url';
@@ -18,6 +20,11 @@ export class EngineSound {
   ready: Promise<void> | null = null;
   private voice: AudioWorkletNode | null = null;
   private voiceKey = '';
+  private exConv!: ConvolverNode;
+  private inConv!: ConvolverNode;
+  private exGain!: GainNode;
+  private inGain!: GainNode;
+  private irs = new Map<string, AudioBuffer>();
   private master!: GainNode;
   private space!: GainNode;
   private mechGain!: GainNode;
@@ -134,55 +141,70 @@ export class EngineSound {
       }
     }
 
-    // the engine voice. a touch of low shelf for body, then into the room and out
+    // the engine voice: flow noise from the worklet through a recorded exhaust response
+    this.exConv = c.createConvolver();
+    this.inConv = c.createConvolver();
+    this.exGain = c.createGain();
+    this.exGain.gain.value = 3;
+    this.inGain = c.createGain();
+    this.inGain.gain.value = 0.35;
     const hp = c.createBiquadFilter();
     hp.type = 'highpass';
-    hp.frequency.value = 22;
-    const shelf = c.createBiquadFilter();
-    shelf.type = 'lowshelf';
-    shelf.frequency.value = 140;
-    shelf.gain.value = 4;
-    hp.connect(shelf);
-    shelf.connect(this.master);
-    shelf.connect(this.space);
-    this.ready = c.audioWorklet.addModule(workletUrl).then(() => {
-      this.voice = new AudioWorkletNode(c, 'engine-voice', { numberOfInputs: 0, outputChannelCount: [2] });
-      this.voice.connect(hp);
+    hp.frequency.value = 25;
+    const inLp = c.createBiquadFilter();
+    inLp.type = 'lowpass';
+    inLp.frequency.value = 2400;
+    this.exConv.connect(this.exGain).connect(hp);
+    this.inConv.connect(inLp).connect(this.inGain).connect(hp);
+    hp.connect(this.master);
+    hp.connect(this.space);
+    const base = import.meta.env.BASE_URL;
+    const load = (name: string) =>
+      fetch(`${base}audio/${name}.wav`)
+        .then((r) => r.arrayBuffer())
+        .then((b) => c.decodeAudioData(b))
+        .then((buf) => {
+          this.irs.set(name, buf);
+        });
+    this.ready = Promise.all([
+      c.audioWorklet.addModule(workletUrl),
+      ...['smooth_39', 'mild_exhaust', 'mild_exhaust_reverb', 'minimal_muffling_01', 'minimal_muffling_02', 'sharp_01'].map(load),
+    ]).then(() => {
+      this.voice = new AudioWorkletNode(c, 'engine-voice', { numberOfInputs: 0, numberOfOutputs: 2, outputChannelCount: [2, 1] });
+      this.voice.connect(this.exConv, 0);
+      this.voice.connect(this.inConv, 1);
+      this.inConv.buffer = this.irs.get('sharp_01') ?? null;
     });
     return this.ready;
   }
 
-  // tell the audio thread what it is: pipe lengths, valve timing, firing offsets
+  // pick the exhaust for this engine and set how rough the flow noise is
   private configure(e: Engine) {
     const v = this.voice;
     if (!v) return;
     const t = e.tune;
-    const w = e.win;
-    const key = `${t.layout}|${t.turbo}|${t.runner}|${w.inC}|${w.inD}|${w.exC}|${w.exD}|${e.cyls.map((c) => c.tdc).join(',')}`;
+    const n = e.layout.cyls.length;
+    const rot = e.kind === 'rotary';
+    let ir = 'mild_exhaust';
+    if (t.turbo) ir = 'smooth_39';
+    else if (rot) ir = 'minimal_muffling_01';
+    else if (n === 8 && t.valvetrain === 'pushrod') ir = 'smooth_39';
+    else if (n === 8) ir = 'mild_exhaust_reverb';
+    else if (n <= 2) ir = 'minimal_muffling_02';
+    const key = `${ir}|${rot}|${n}|${e.win.inC}|${e.win.inD}`;
     if (key === this.voiceKey) return;
     this.voiceKey = key;
-    const rot = e.kind === 'rotary';
-    const banks = e.layout.cyls.map((c) => (c.bank > 0 ? 1 : 0));
-    const split = banks.includes(1) && banks.includes(0);
-    const vCyl = e.Vd * 1000;
-    const f = (deg: number) => (((deg / 720) % 1) + 1) % 1;
+    this.exConv.buffer = this.irs.get(ir) ?? null;
+    // big overlap pushes exhaust back up the intake, that honk is half of a bridgeport
+    const w = e.win;
+    const overlap = Math.max(0, w.exC + w.exD / 2 - 720 - (w.inC - w.inD / 2));
+    this.inGain.gain.value = 0.25 + Math.min(1, overlap / 120) * (rot ? 0.9 : 0.4);
     v.port.postMessage({
-      type: 'config',
-      cfg: {
-        cyls: e.cyls.map((c, i) => ({ offset: f(360 - c.tdc * e.kN), bank: split ? banks[i] : 0 })),
-        inOpen: f(w.inC - w.inD / 2),
-        inClose: f(w.inC + w.inD / 2),
-        exOpen: f(w.exC - w.exD / 2),
-        exClose: f(w.exC + w.exD / 2),
-        ramp: rot ? 0.008 : 0.05,
-        runner: Math.max(0.08, t.runner / 1000),
-        primary: rot ? 0.32 : Math.min(1, Math.max(0.35, 0.78 * Math.sqrt(vCyl / 0.65))),
-        collector: rot ? 0.9 : e.layout.cyls.length <= 2 ? 0.9 : 1.35,
-        rotary: rot,
-        turbo: t.turbo,
-        split,
-        blowTau: rot ? 0.0009 : 0.0019,
-      },
+      type: 'params',
+      noise: rot ? 0.55 : 0.8,
+      df: rot ? 0.02 : 0.012,
+      jitter: rot ? 0.25 : n === 8 ? 0.55 : 0.4,
+      maxGain: 80,
     });
   }
 
@@ -223,12 +245,17 @@ export class EngineSound {
     const slow = Math.max(timeScale, 0.001);
     const rpm = Math.max(0, r.rpm);
     const live = timeScale > 0.5;
-    const load = Math.min(1.6, r.map / 101325);
 
     if (this.voice) {
-      // cycles per second the audio thread should run, slowed with the sim
-      const cps = (rpm / 60) * (360 / e.cycleLen) * timeScale;
-      this.voice.port.postMessage({ type: 'state', cps, load, throttle: r.throttle, on: rpm > 20 || r.cranking });
+      this.voice.port.postMessage({ type: 'on', on: rpm > 20 || r.cranking });
+      const au = e.audio;
+      if (au.dt.length) {
+        const dt = Float32Array.from(au.dt);
+        const a = Float32Array.from(au.a);
+        const b = Float32Array.from(au.b);
+        const cc = Float32Array.from(au.c);
+        this.voice.port.postMessage({ type: 'flow', dt, a, b, c: cc, scale: Math.max(timeScale, 0.001) }, [dt.buffer, a.buffer, b.buffer, cc.buffer]);
+      }
     }
 
     this.mechGain.gain.setTargetAtTime(live ? (0.002 + Math.min(1, rpm / 7000) * 0.008) * (e.kind === 'rotary' ? 0.25 : e.tune.valvetrain === 'pushrod' ? 1.3 : 1) : 0, now, 0.08);
@@ -254,10 +281,10 @@ export class EngineSound {
     for (const ev of e.events) {
       const at = base + ev.t / slow;
       if (at > now + 1.5) continue;
-      if (ev.type === 'exhaust') {
-        this.voice?.port.postMessage({ type: 'blow', cyl: ev.cyl, amp: Math.max(0, ev.amp) * (r.fuelCut ? 0.5 : 1) });
-      } else if (ev.type === 'pop') {
-        this.voice?.port.postMessage({ type: 'pop', cyl: ev.cyl, amp: 0.4 + ev.amp * 0.6 });
+      if (ev.type === 'pop') {
+        // raw mixture lighting in the header: a hard crack
+        this.burst(at, 0.05, 'bandpass', 900, 0.6, 0.14 * ev.amp);
+        this.burst(at, 0.03, 'highpass', 2500, 0.7, 0.05 * ev.amp);
       } else if (ev.type === 'knock') {
         const src = ctx.createBufferSource();
         src.buffer = this.ping;
@@ -269,8 +296,15 @@ export class EngineSound {
         this.burst(at, 0.55 + ev.amp * 0.3, 'bandpass', 3400, 0.9, 0.14 * ev.amp, 1400);
         this.burst(at, 0.25, 'highpass', 5000, 0.6, 0.05 * ev.amp);
       } else if (ev.type === 'surge') {
-        this.burst(at, 0.045, 'bandpass', 520 + Math.random() * 160, 3, 0.16 * ev.amp);
-        this.burst(at, 0.03, 'bandpass', 2600, 2, 0.04 * ev.amp);
+        // compressor surge: the air stalls and slams back out through the wheel,
+        // a chuff per cycle with the turbo whine dipping each time
+        this.burst(at, 0.075, 'bandpass', 380 + Math.random() * 120, 1.4, 0.3 * ev.amp, 220);
+        this.burst(at, 0.05, 'bandpass', 1500 + Math.random() * 400, 1.1, 0.14 * ev.amp, 700);
+        this.burst(at + 0.004, 0.02, 'highpass', 3500, 0.7, 0.05 * ev.amp);
+        const wg = this.whistleGain.gain;
+        wg.cancelScheduledValues(at);
+        wg.setValueAtTime(wg.value * 0.3, at);
+        wg.linearRampToValueAtTime(wg.value, at + 0.05);
       } else if (ev.type === 'failure') {
         const src = ctx.createBufferSource();
         src.buffer = this.crash;
