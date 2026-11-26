@@ -1,4 +1,10 @@
-// Engine voice, audio thread side. Two ways of making the noise, picked per engine.
+// Engine voice, audio thread side. Three ways of making the noise, picked per engine.
+//
+// 'grain' (piston engines with a recording): real engine recordings cut into short grains,
+// each tagged with the rpm and throttle it was recorded at (see public/audio/banks). Every
+// grain picks the closest match to where the sim is and gets resampled to the exact rpm,
+// overlap added back to back. Exhaust events from the sim still shape the level, so a
+// misfire or a lumpy cam shows up on top of the recording.
 //
 // 'ptr' (piston engines): a pulse train lined up with the firing order, one pulse per
 // exhaust opening, sized by what the sim says that cylinder blew down. Each pulse is an
@@ -114,6 +120,26 @@ class KS {
   }
 }
 
+interface Bank {
+  buf: Float32Array;
+  sr: number;
+  n: number; // cylinders on the engine it was recorded from
+  t: Float32Array;
+  P: Float32Array;
+  rpm: Float32Array;
+  ld: Float32Array;
+  g: Float32Array;
+  byRpm: Int32Array; // mark indices sorted by rpm
+}
+
+interface Grain {
+  pos: number; // source sample
+  inc: number;
+  i: number;
+  len: number;
+  amp: number;
+}
+
 interface Pulse {
   phi: number; // radians since the exhaust opened, of a full cycle
   amp: number;
@@ -134,7 +160,15 @@ class EngineVoice extends AudioWorkletProcessor {
   last = [0, 0, 0];
   pendT = -1;
   pendA = 0;
-  mode: 'ptr' | 'flow' = 'ptr';
+  mode: 'ptr' | 'flow' | 'grain' = 'ptr';
+  bank: Bank | null = null;
+  grains: Grain[] = [];
+  nextGrain = 0;
+  cur = -1;
+  nCyl = 8;
+  taAvg = 0.3;
+  fireEnv = 1;
+  fireEnvT = 1;
   banks: number[] = [];
   pulses: Pulse[] = [];
   cps = 0;
@@ -176,8 +210,13 @@ class EngineVoice extends AudioWorkletProcessor {
         this.gThrT = m.gThr;
         this.gDfcoT = m.gDfco;
         this.onT = m.on ? 1 : 0;
+      } else if (m.type === 'bank') {
+        this.bank = m.bank;
+        this.grains = [];
+        this.cur = -1;
       } else if (m.type === 'config') {
         this.mode = m.mode;
+        this.nCyl = m.nCyl ?? this.nCyl;
         this.banks = m.banks;
         this.attack = m.attack;
         this.decay = m.decay;
@@ -252,6 +291,78 @@ class EngineVoice extends AudioWorkletProcessor {
     return out;
   }
 
+  // the mark closest to the rpm and throttle we want, with a little randomness so a steady
+  // rpm doesn't loop the same few grains
+  pickGrain(b: Bank, rpmEq: number, load: number) {
+    const M = b.byRpm.length;
+    let lo = 0;
+    let hi = M - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (b.rpm[b.byRpm[mid]] < rpmEq) lo = mid + 1;
+      else hi = mid;
+    }
+    let best = b.byRpm[Math.min(lo, M - 1)];
+    let bc = 1e9;
+    const a = Math.max(0, lo - 80);
+    const z = Math.min(M, lo + 80);
+    for (let k = a; k < z; k++) {
+      const j = b.byRpm[k];
+      const c = Math.abs(Math.log(b.rpm[j] / rpmEq)) + 0.3 * Math.abs(b.ld[j] - load) + this.rand() * 0.06;
+      if (c < bc) {
+        bc = c;
+        best = j;
+      }
+    }
+    return best;
+  }
+
+  grainSample(): number {
+    const b = this.bank!;
+    const rpm = this.cps * 120;
+    if (this.on > 0.01 && rpm > 30) {
+      this.nextGrain--;
+      if (this.nextGrain <= 0) {
+        const rpmEq = (rpm * this.nCyl) / b.n;
+        const load = this.gDfco > 0.05 ? 0 : Math.min(1, this.gThr * 1.1);
+        let j = this.cur + 1;
+        // keep reading the recording forward while it still fits, jump when it doesn't
+        if (
+          this.cur < 0 ||
+          j >= b.t.length ||
+          b.t[j] - b.t[this.cur] > b.P[this.cur] * 2 ||
+          Math.abs(Math.log(b.rpm[j] / rpmEq)) > 0.09 ||
+          Math.abs(b.ld[j] - load) > 0.45 ||
+          this.rand() < 0.015
+        )
+          j = this.pickGrain(b, rpmEq, load);
+        this.cur = j;
+        const r = Math.min(5, Math.max(0.4, rpmEq / b.rpm[j]));
+        const inc = (r * b.sr) / sampleRate;
+        const half = b.P[j] * b.sr;
+        const len = Math.max(8, Math.round((2 * half) / inc));
+        this.grains.push({ pos: b.t[j] * b.sr - half, inc, i: 0, len, amp: Math.pow(b.g[j], 0.7) });
+        this.nextGrain = len / 2;
+      }
+    }
+    let y = 0;
+    const buf = b.buf;
+    for (let k = this.grains.length - 1; k >= 0; k--) {
+      const gr = this.grains[k];
+      const p = gr.pos;
+      const i0 = Math.floor(p);
+      if (i0 >= 0 && i0 + 1 < buf.length) {
+        const fr = p - i0;
+        const w = 0.5 - 0.5 * Math.cos((TWO_PI * gr.i) / gr.len);
+        y += (buf[i0] + (buf[i0 + 1] - buf[i0]) * fr) * w * gr.amp;
+      }
+      gr.pos += gr.inc;
+      gr.i++;
+      if (gr.i >= gr.len) this.grains.splice(k, 1);
+    }
+    return y;
+  }
+
   process(_in: Float32Array[][], outputs: Float32Array[][]) {
     const ex = outputs[0];
     const inn = outputs[1];
@@ -291,6 +402,23 @@ class EngineVoice extends AudioWorkletProcessor {
 
       let l = 0;
       let r = 0;
+      if (this.mode === 'grain' && this.bank) {
+        // each exhaust event nudges the level by how hard that cylinder actually blew down
+        if (tc >= 0 && tc < 100) {
+          this.taAvg += (ta - this.taAvg) * 0.04;
+          this.fireEnvT = Math.min(1.25, Math.max(0.12, ta / Math.max(1e-3, this.taAvg)));
+        }
+        this.fireEnv += (Math.sqrt(this.fireEnvT) - this.fireEnv) * 0.01;
+        const rpm = this.cps * 120;
+        const lvl = (0.3 + 0.7 * Math.min(1, this.gThr)) * (0.65 + 0.35 * Math.min(1, rpm / 5000)) * (1 - 0.35 * this.gDfco);
+        const y = this.grainSample() * lvl * this.fireEnv * 0.55;
+        l = y;
+        r = y;
+        ex[0][s] = l * this.on;
+        ex[1][s] = r * this.on;
+        if (inn) inn[0][s] = 0;
+        continue;
+      }
       if (this.mode === 'ptr') {
         if (tc >= 0) {
           const pop = tc >= 100;

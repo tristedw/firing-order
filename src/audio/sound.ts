@@ -1,8 +1,10 @@
-// Engine sound. The sim streams header and intake runner pressure plus every exhaust
-// opening and backfire, at its own step rate. The audio thread (engine-worklet.ts) turns
-// that into a firing pulse train through pipe resonators for piston engines, or into
-// flow noise through a recorded exhaust from engine-sim (MIT, see public/audio) for
-// rotaries. This side adds turbo whine, BOV, surge, knock ping, the starter and a room.
+// Engine sound. Piston engines play real recordings (CC0 / CC BY from freesound, see
+// public/audio/banks/CREDITS.md) cut into grains and pitched to the sim's rpm by the audio
+// thread (engine-worklet.ts). There are no free rotary recordings out there, so rotaries
+// still run the sim's header flow through a recorded exhaust response from engine-sim
+// (MIT, see public/audio). If a bank hasn't loaded yet the pulse train synth covers it.
+// This side adds recorded backfires and BOV, plus turbo whine, surge, knock ping, the
+// starter and a room.
 
 import type { Engine, Readings } from '../sim/engine';
 import workletUrl from './engine-worklet.ts?worker&url';
@@ -39,6 +41,11 @@ export class EngineSound {
   private noise!: AudioBuffer;
   private ping!: AudioBuffer;
   private crash!: AudioBuffer;
+  private banks = new Map<string, Promise<void>>();
+  private bankReady = new Set<string>();
+  private bankName = '';
+  private shots = new Map<string, AudioBuffer>();
+  private mode: 'ptr' | 'flow' | 'grain' = 'ptr';
   enabled = true;
   volume = 0.7;
 
@@ -169,6 +176,15 @@ export class EngineSound {
         .then((buf) => {
           this.irs.set(name, buf);
         });
+    const shot = (name: string) =>
+      fetch(`${base}audio/banks/${name}.mp3`)
+        .then((r) => r.arrayBuffer())
+        .then((b) => c.decodeAudioData(b))
+        .then((buf) => {
+          this.shots.set(name, buf);
+        })
+        .catch(() => {});
+    ['pop0', 'pop1', 'pop2', 'bov'].forEach(shot);
     this.ready = Promise.all([
       c.audioWorklet.addModule(workletUrl),
       ...['smooth_39', 'mild_exhaust', 'mild_exhaust_reverb', 'minimal_muffling_01', 'minimal_muffling_02', 'sharp_01'].map(load),
@@ -182,6 +198,58 @@ export class EngineSound {
     return this.ready;
   }
 
+  // which recording fits this engine. a big overlap cam V8 gets the lumpy one
+  private pickBank(e: Engine) {
+    const t = e.tune;
+    const w = e.win;
+    const overlap = Math.max(0, w.exC + w.exD / 2 - 720 - (w.inC - w.inD / 2));
+    switch (t.layout) {
+      case 'v8-cross':
+      case 'v8-ls':
+        return overlap > 40 ? 'v8cam' : 'v8';
+      case 'v8-flat':
+        return 'flat8';
+      case 'i4':
+      case 'i3':
+        return t.turbo ? 'fourT' : 'four';
+      case 'i6':
+        return 'six';
+      case 'vtwin':
+        return 'twin';
+      case 'single':
+        return 'single';
+      default:
+        return '';
+    }
+  }
+
+  private loadBank(name: string) {
+    let p = this.banks.get(name);
+    if (p) return p;
+    const c = this.ctx!;
+    const url = `${import.meta.env.BASE_URL}audio/banks/${name}`;
+    p = Promise.all([
+      fetch(`${url}.json`).then((r) => r.json()),
+      fetch(`${url}.mp3`)
+        .then((r) => r.arrayBuffer())
+        .then((b) => c.decodeAudioData(b)),
+    ])
+      .then(([meta, audio]) => {
+        const marks: number[][] = meta.marks;
+        const M = marks.length;
+        const col = (k: number) => Float32Array.from(marks, (m) => m[k]);
+        const rpm = col(2);
+        const byRpm = Int32Array.from(Array.from({ length: M }, (_, i) => i).sort((a, b) => rpm[a] - rpm[b]));
+        this.bankData.set(name, { buf: audio.getChannelData(0), sr: audio.sampleRate, n: meta.n, t: col(0), P: col(1), rpm, ld: col(3), g: col(4), byRpm });
+        this.bankReady.add(name);
+        this.voiceKey = '';
+      })
+      .catch(() => {});
+    this.banks.set(name, p);
+    return p;
+  }
+  private bankData = new Map<string, unknown>();
+
   // rotaries use the sim's own header flow through a recorded exhaust, everything else
   // the pulse train and resonators. tune the resonators to the pipes this engine has
   private configure(e: Engine) {
@@ -191,9 +259,17 @@ export class EngineSound {
     const n = e.layout.cyls.length;
     const rot = e.kind === 'rotary';
     const w = e.win;
-    const key = `${t.layout}|${t.turbo}|${t.valvetrain}|${w.inC}|${w.inD}|${w.exC}|${w.exD}`;
+    const bank = rot ? '' : this.pickBank(e);
+    if (bank) this.loadBank(bank);
+    const grain = !!bank && this.bankReady.has(bank);
+    const key = `${t.layout}|${t.turbo}|${t.valvetrain}|${w.inC}|${w.inD}|${w.exC}|${w.exD}|${grain}`;
     if (key === this.voiceKey) return;
     this.voiceKey = key;
+    if (grain && bank !== this.bankName) {
+      this.bankName = bank;
+      v.port.postMessage({ type: 'bank', bank: this.bankData.get(bank) });
+    }
+    this.mode = rot ? 'flow' : grain ? 'grain' : 'ptr';
     const banks = e.layout.cyls.map((c) => (c.bank > 0 ? 1 : 0));
     const vCyl = e.Vd * 1000;
     let ir = 'mild_exhaust';
@@ -202,17 +278,18 @@ export class EngineSound {
     else if (n === 8) ir = 'mild_exhaust_reverb';
     this.exConv.buffer = this.irs.get(ir) ?? null;
     const now = this.ctx!.currentTime;
-    this.exGain.gain.setTargetAtTime(rot ? 1.2 : 0.45, now, 0.05);
-    this.dryGain.gain.setTargetAtTime(rot ? 0 : 0.8, now, 0.05);
+    this.exGain.gain.setTargetAtTime(rot ? 1.2 : grain ? 0 : 0.45, now, 0.05);
+    this.dryGain.gain.setTargetAtTime(rot ? 0 : grain ? 1 : 0.8, now, 0.05);
     // big overlap pushes exhaust back up the intake, that honk is half of a bridgeport
     const overlap = Math.max(0, w.exC + w.exD / 2 - 720 - (w.inC - w.inD / 2));
-    this.inGain.gain.setTargetAtTime((rot ? 0.2 + Math.min(1, overlap / 120) * 0.9 : 0.04 + Math.min(1, overlap / 120) * 0.08) * 0.4, now, 0.05);
+    this.inGain.gain.setTargetAtTime(grain ? 0 : (rot ? 0.2 + Math.min(1, overlap / 120) * 0.9 : 0.04 + Math.min(1, overlap / 120) * 0.08) * 0.4, now, 0.05);
     // header primaries ring around a quarter wave of their length, the tailpipe much lower
     const primary = Math.min(1, Math.max(0.35, 0.78 * Math.sqrt(vCyl / 0.65)));
     const hot = 520;
     v.port.postMessage({
       type: 'config',
-      mode: rot ? 'flow' : 'ptr',
+      mode: this.mode,
+      nCyl: n,
       banks,
       // bigger cylinders blow down slower, a big cam lets go earlier and harder
       attack: 34 - Math.min(12, vCyl * 8),
@@ -254,6 +331,20 @@ export class EngineSound {
     g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
     src.connect(f).connect(g).connect(this.master);
     src.start(at, Math.random() * 1.5, dur + 0.05);
+  }
+
+  private play(name: string, at: number, gain: number, rate = 1) {
+    const buf = this.shots.get(name);
+    if (!buf || !this.ctx) return false;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.playbackRate.value = rate;
+    const g = this.ctx.createGain();
+    g.gain.value = gain;
+    src.connect(g).connect(this.master);
+    g.connect(this.space);
+    src.start(at);
+    return true;
   }
 
   // events are stamped in sim seconds from the start of this frame's update
@@ -315,7 +406,10 @@ export class EngineSound {
         g.gain.value = 0.12 + ev.amp * 0.4;
         src.connect(g).connect(this.master);
         src.start(at);
+      } else if (ev.type === 'pop') {
+        if (this.mode !== 'flow') this.play(`pop${Math.floor(Math.random() * 3)}`, at, Math.min(0.9, 0.25 + ev.amp * 0.6), 0.85 + Math.random() * 0.3);
       } else if (ev.type === 'bov') {
+        if (this.play('bov', at, 0.3 * Math.min(1.5, ev.amp), 0.9 + Math.random() * 0.2)) continue;
         this.burst(at, 0.55 + ev.amp * 0.3, 'bandpass', 3400, 0.9, 0.14 * ev.amp, 1400);
         this.burst(at, 0.25, 'highpass', 5000, 0.6, 0.05 * ev.amp);
       } else if (ev.type === 'surge') {

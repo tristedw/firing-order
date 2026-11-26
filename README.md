@@ -33,7 +33,7 @@ Each cylinder is a single zone of gas tracked by mass, temperature and how much 
 - **Turbo**: toggle it on any engine. Wastegate pressure, compressor size, intercooler and blow off valve. The wheel spools off exhaust flow and heat, so a big turbo lags and a small one chokes up top, heats the charge, backs up the exhaust and can overspeed until the wheel lets go. Lift without a BOV and the compressor surges.
 - **Cylinder pressure limit**: peak pressure past what the head gasket (or rotary seals) holds wears it down cycle by cycle until it blows.
 - **Dilution and misfires**: exhaust pushed back up the intake during overlap comes back in with the next charge. A diluted charge burns slow and uneven and some cycles never light, which is where a big cam's lope and a bridgeport's brap come from. Unlit mixture can pop in the header.
-- **Sound**: driven by the sim, every exhaust opening and backfire lands on the cycle it happened. Piston engines use a pulse train aligned to the firing order, one pulse per exhaust opening sized by the sim's blowdown, shaped and pitch bent like the Pulse-Train-Resonator model (Doerfler and Wyse, EUSIPCO 2026) and run through Karplus-Strong resonators for the headers and tailpipe. Rotaries use the sim's header flow turned into flow noise and convolved with a recorded exhaust, the way AngeTheGreat's [engine-sim](https://github.com/ange-yaghi/engine-sim) does it. The impulse responses in `public/audio` are from engine-sim (MIT, license alongside). Turbo whine, BOV, compressor surge and knock ping sit on top.
+- **Sound**: piston engines play real recordings from freesound (CC0 and CC BY, credits in `public/audio/banks/CREDITS.md`). Each recording is pitch tracked offline and cut into grains tagged with rpm and throttle. At runtime every grain picks the closest match to the sim and gets resampled to the exact rpm, and each exhaust opening from the sim scales the level, so misfires and a lumpy cam still come through. Backfires and the BOV are recorded one shots. There are no free rotary recordings, so rotaries use the sim's header flow turned into flow noise and convolved with a recorded exhaust, the way AngeTheGreat's [engine-sim](https://github.com/ange-yaghi/engine-sim) does it (impulse responses in `public/audio`, MIT). Turbo whine, compressor surge and knock ping sit on top.
 - **Misfire and knock counters**: totals and a per minute rate, per cylinder too. Click either readout to reset.
 - **Units**: imperial or metric everywhere, tune fields, inspector, charts and readouts.
 - **Pushrod or overhead cam**: the small blocks and the big twin run one cam in the block with lifters, pushrods and rockers. Lobe lift times rocker ratio is valve lift (LS heads are 1.7, an SBC 1.5), and the extra valvetrain weight makes the valves float a little sooner than an OHC with the same springs. Any piston engine can be switched in the Camshaft tab.
@@ -46,7 +46,7 @@ Each rotor flank is treated as its own chamber running a four stroke cycle over 
 
 It is tuned to land in the right ballpark (a stock-ish 350 makes around 340 lb-ft and 330 hp) rather than to match any real engine. MBT spark falls out of the model instead of being hard coded, which makes the spark table actually worth playing with.
 
-Sound is generated live. Every exhaust valve opening schedules a pulse sized by cylinder pressure at blowdown, so firing order, the lumpy twin, misfires and the limiter all come out of the sim.
+Sound follows the sim live. Recorded grains are picked and pitched by rpm and throttle every few milliseconds, and every exhaust valve opening scales them by that cylinder's blowdown, so misfires and the limiter come out of the sim.
 
 ## Keys
 
@@ -78,7 +78,7 @@ TypeScript, three.js, Vite, Web Audio. No framework, the UI is plain DOM.
 src/
   sim/       engine model, layouts and firing angles, tunes and presets
   render/    three.js scene, procedural engine geometry
-  audio/     procedural exhaust, intake and knock sound
+  audio/     recorded grain engine sound, rotary flow synth, knock and turbo
   ui/        tune panel, spark table, gauges and charts
 ```
 
