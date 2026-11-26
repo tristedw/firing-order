@@ -29,6 +29,8 @@ export interface Tune {
   recipMass: number; // grams, piston + pin + rings + small end
   rodStrength: number; // kN of inertial tension the rods survive
   tbMm: number; // throttle body bore, 0 = size it from displacement
+  valvetrain: 'ohc' | 'pushrod';
+  rockerRatio: number; // pushrod only, valve lift / lobe lift
   knockSensors: boolean;
   // rotary only, mm and e-shaft deg
   rotorR: number; // generating radius
@@ -73,6 +75,8 @@ const base: Omit<Tune, 'name' | 'layout' | 'bore' | 'stroke' | 'rod'> = {
   recipMass: 520,
   rodStrength: 20,
   tbMm: 0,
+  valvetrain: 'ohc',
+  rockerRatio: 1.5,
   knockSensors: true,
   rotorR: 105,
   rotorE: 15,
@@ -98,6 +102,9 @@ export const PRESETS: Tune[] = [
     exCenterline: 114,
     inLift: 11.3,
     exLift: 11.5,
+    valvetrain: 'pushrod',
+    rockerRatio: 1.5,
+    springRate: 1.08,
     runner: 380,
     revLimit: 6000,
     idleRpm: 700,
@@ -119,7 +126,9 @@ export const PRESETS: Tune[] = [
     exCenterline: 118,
     inLift: 13.26,
     exLift: 13.44,
-    springRate: 1.15,
+    valvetrain: 'pushrod',
+    rockerRatio: 1.7,
+    springRate: 1.22,
     runner: 470,
     tbMm: 78,
     afrCruise: 14.7,
@@ -131,7 +140,7 @@ export const PRESETS: Tune[] = [
     spark: makeSpark(36, 16, 13, 4000),
     flywheel: 1.25,
     recipMass: 700,
-    notes: '2004 Tahoe 5.3 LM7. Melling MTC-8 cam, cold air intake, headers, 78 mm drive by wire throttle body. 87 octane, no knock sensors so knock control is off and the spark table is all you get. SM465 manual, so a heavier flywheel.',
+    notes: '2004 Tahoe 5.3 LM7. Gen 3 small block, so one cam in the block, pushrods and 1.7 rockers. Melling MTC-8 cam, cold air intake, headers, 78 mm drive by wire throttle body. 87 octane, no knock sensors so knock control is off and the spark table is all you get. SM465 manual, so a heavier flywheel.',
   },
   {
     ...base,
@@ -148,6 +157,9 @@ export const PRESETS: Tune[] = [
     exCenterline: 116,
     inLift: 11.6,
     exLift: 11.84,
+    valvetrain: 'pushrod',
+    rockerRatio: 1.7,
+    springRate: 1.08,
     runner: 470,
     tbMm: 78,
     afrWot: 12.6,
@@ -276,6 +288,9 @@ export const PRESETS: Tune[] = [
     exCenterline: 112,
     inLift: 11,
     exLift: 10.5,
+    valvetrain: 'pushrod',
+    rockerRatio: 1.625,
+    springRate: 1.1,
     revLimit: 5500,
     idleRpm: 900,
     runner: 260,

@@ -11,10 +11,10 @@ interface Field {
   max: number;
   step: number;
   hint?: string;
-  only?: 'piston' | 'rotary';
+  only?: 'piston' | 'rotary' | 'pushrod';
 }
 
-export const GEOMETRY_KEYS = new Set<keyof Tune>(['layout', 'bore', 'stroke', 'rod', 'compression', 'inDuration', 'exDuration', 'inLift', 'exLift', 'rotorR', 'rotorE', 'rotorB']);
+export const GEOMETRY_KEYS = new Set<keyof Tune>(['valvetrain', 'rockerRatio', 'layout', 'bore', 'stroke', 'rod', 'compression', 'inDuration', 'exDuration', 'inLift', 'exLift', 'rotorR', 'rotorE', 'rotorB']);
 
 const GROUPS: { id: string; name: string; fields: Field[] }[] = [
   {
@@ -43,7 +43,8 @@ const GROUPS: { id: string; name: string; fields: Field[] }[] = [
       { key: 'exCenterline', label: 'Exhaust centerline', unit: '° BTDC', min: 90, max: 130, step: 0.5, only: 'piston' },
       { key: 'inLift', label: 'Intake lift', unit: 'mm', min: 4, max: 17, step: 0.1, only: 'piston' },
       { key: 'exLift', label: 'Exhaust lift', unit: 'mm', min: 4, max: 17, step: 0.1, only: 'piston' },
-      { key: 'springRate', label: 'Valve springs', unit: '×', min: 0.6, max: 2, step: 0.05, only: 'piston', hint: 'Stiffer springs push valve float higher.' },
+      { key: 'rockerRatio', label: 'Rocker ratio', unit: ':1', min: 1.3, max: 2, step: 0.05, only: 'pushrod', hint: 'Valve lift is lobe lift times this. LS heads run 1.7, a small block Chevy 1.5.' },
+      { key: 'springRate', label: 'Valve springs', unit: '×', min: 0.6, max: 2, step: 0.05, only: 'piston', hint: 'Stiffer springs push valve float higher. Pushrod valvetrains carry more weight and float a bit sooner.' },
       { key: 'portIO', label: 'Intake opens', unit: '° ATDC', min: -10, max: 60, step: 1, only: 'rotary', hint: 'E-shaft degrees. Porting a rotary is the same game as picking a cam: open earlier and close later for top end.' },
       { key: 'portIC', label: 'Intake closes', unit: '° ABDC', min: 20, max: 100, step: 1, only: 'rotary' },
       { key: 'portEO', label: 'Exhaust opens', unit: '° BBDC', min: 30, max: 100, step: 1, only: 'rotary' },
@@ -84,6 +85,8 @@ export class TunePanel {
   private notesEl!: HTMLElement;
   private sparkNote!: HTMLElement;
   private layoutSel!: HTMLSelectElement;
+  private vtSel!: HTMLSelectElement;
+  private vtRow!: HTMLElement;
   private derived = new Map<string, HTMLElement>();
   private cells: HTMLElement[][] = [];
   private sel = { r0: 0, c0: 0, r1: 0, c1: 0, active: false };
@@ -126,6 +129,7 @@ export class TunePanel {
       const sec = el('section', 'pane');
       sec.dataset.pane = g.id;
       if (g.id === 'engine') sec.append(this.layoutRow());
+      if (g.id === 'cam') sec.append(this.valvetrainRow());
       for (const f of g.fields) sec.append(this.fieldRow(f));
       sec.append(this.derivedBlock(g.id));
       body.append(sec);
@@ -160,6 +164,30 @@ export class TunePanel {
       this.sync();
     };
     this.layoutSel = s;
+    row.append(s);
+    return row;
+  }
+
+  private valvetrainRow() {
+    const row = el('label', 'field');
+    const top = el('span', 'field-top');
+    top.append(text('span', 'field-label', 'Valvetrain'));
+    row.append(top);
+    const s = document.createElement('select');
+    s.className = 'select';
+    for (const [v, n] of [['ohc', 'Overhead cam'], ['pushrod', 'Pushrod, cam in block']]) {
+      const o = document.createElement('option');
+      o.value = v;
+      o.textContent = n;
+      s.append(o);
+    }
+    s.onchange = () => {
+      this.tune().valvetrain = s.value as Tune['valvetrain'];
+      this.hooks.onChange('valvetrain');
+      this.sync();
+    };
+    this.vtSel = s;
+    this.vtRow = row;
     row.append(s);
     return row;
   }
@@ -412,6 +440,9 @@ export class TunePanel {
     const t = this.tune();
     const kind = LAYOUTS[t.layout].kind;
     this.layoutSel.value = t.layout;
+    this.vtSel.value = t.valvetrain ?? 'ohc';
+    this.vtRow.hidden = kind === 'rotary';
+    const pushrod = kind === 'piston' && t.valvetrain === 'pushrod';
     this.notesEl.textContent = t.notes ?? '';
     this.notesEl.hidden = !t.notes;
     const camTab = this.host.querySelector<HTMLElement>('.tab[data-tab="cam"]');
@@ -421,7 +452,7 @@ export class TunePanel {
         ? 'Ignition advance in e-shaft degrees before TDC. Rows are manifold pressure, columns are rpm. The outlined cell is where the engine is running right now.'
         : 'Ignition advance in degrees before TDC. Rows are manifold pressure, columns are rpm. The outlined cell is where the engine is running right now.';
     for (const { f, num, range, row } of this.inputs) {
-      row.hidden = !!f.only && f.only !== kind;
+      row.hidden = f.only === 'pushrod' ? !pushrod : !!f.only && f.only !== kind;
       const k = f.key;
       const v = t[k] as number;
       if (document.activeElement !== num) num.value = String(+v.toFixed(2));

@@ -421,6 +421,7 @@ const PART_COPY: Record<PartHit['kind'], [string, string]> = {
   flywheel: ['Flywheel', 'Stores energy between power strokes so the engine keeps turning. The red mark lines up with crankpin 1.'],
   plug: ['Spark plug', 'Fires at the angle from the spark table. Too early and the unburnt gas lights off on its own. That is knock.'],
   cylinder: ['Cylinder', ''],
+  pushrod: ['Lifter, pushrod and rocker', 'One cam down in the block works every valve. The lifter rides the lobe, the pushrod carries the motion up to the rocker, and the rocker multiplies it by its ratio on the way to the valve.'],
   rotor: ['Rotor', 'Three flanks make three chambers. It turns once for every three turns of the e-shaft, kept in step by its ring gear walking round the fixed gear.'],
 };
 
@@ -497,7 +498,11 @@ function fillInspector() {
   const hit = inspected;
   if (engine.kind === 'rotary') return fillRotary(hit);
   const c = hit.cyl >= 0 ? engine.cyls[hit.cyl] : null;
-  const [title, desc] = PART_COPY[hit.kind];
+  const pushrodHead = tune.valvetrain === 'pushrod';
+  const [title, desc] =
+    hit.kind === 'cam' && pushrodHead
+      ? (['Camshaft', 'One cam in the block, between the banks on a V. It turns at half crank speed and every valve on the engine gets its timing from one of its lobes.'] as [string, string])
+      : PART_COPY[hit.kind];
   $('insp-title').textContent = c ? `${title}, cylinder ${engine.layout.labels[c.idx]}` : title;
   $('insp-desc').textContent = desc;
   const rows: [string, string][] = [];
@@ -531,14 +536,26 @@ function fillInspector() {
       rows.push(['Pin angles', engine.layout.pins.map((p) => `${p.angle}°`).join(', ')]);
       break;
     }
+    case 'pushrod': {
+      const rr = Math.max(1, t.rockerRatio);
+      rows.push(['Intake lifter', `${fmt(c!.inLift / rr, 2)} mm`]);
+      rows.push(['Exhaust lifter', `${fmt(c!.exLift / rr, 2)} mm`]);
+      rows.push(['Rocker ratio', `${fmt(rr, 2)}:1`]);
+      rows.push(['Intake valve', `${fmt(c!.inLift, 2)} mm`]);
+      rows.push(['Exhaust valve', `${fmt(c!.exLift, 2)} mm`]);
+      rows.push(['Floats above', `${fmt(Math.round(engine.floatRpm / 10) * 10)} rpm`]);
+      break;
+    }
     case 'intake-valve':
       rows.push(['Lift', `${fmt(c!.inLift, 2)} mm`]);
+      if (pushrodHead) rows.push(['Lobe lift', `${fmt(t.inLift / Math.max(1, t.rockerRatio), 2)} mm at ${fmt(t.rockerRatio, 2)}:1`]);
       rows.push(['Opens', `${fmt(720 - ev.intake.open)}° BTDC`]);
       rows.push(['Closes', `${fmt(ev.intake.close - 180)}° ABDC`]);
       rows.push(['Floats above', `${fmt(Math.round(engine.floatRpm / 10) * 10)} rpm`]);
       break;
     case 'exhaust-valve':
       rows.push(['Lift', `${fmt(c!.exLift, 2)} mm`]);
+      if (pushrodHead) rows.push(['Lobe lift', `${fmt(t.exLift / Math.max(1, t.rockerRatio), 2)} mm at ${fmt(t.rockerRatio, 2)}:1`]);
       rows.push(['Opens', `${fmt(540 - ev.exhaust.open)}° BBDC`]);
       rows.push(['Closes', `${fmt(ev.exhaust.close)}° ATDC`]);
       rows.push(['EGT at opening', `${fmt(U.temp(c!.egt)[0])} ${U.temp(c!.egt)[1]}`]);
@@ -548,6 +565,7 @@ function fillInspector() {
       rows.push(['Intake centerline', `${t.inCenterline}° ATDC`]);
       rows.push(['Exhaust centerline', `${t.exCenterline}° BTDC`]);
       rows.push(['Lobe separation', `${fmt((t.inCenterline + t.exCenterline) / 2, 1)}°`]);
+      rows.push(['Valvetrain', pushrodHead ? `Pushrod, ${fmt(t.rockerRatio, 2)} rockers` : 'Overhead cam']);
       break;
     case 'flywheel':
       rows.push(['Inertia', `${fmt(engine.J, 3)} kg m²`]);

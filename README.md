@@ -30,6 +30,7 @@ Each cylinder is a single zone of gas tracked by mass, temperature and how much 
 - **Knock**: Livengood-Wu integral on the end gas using the Douaud-Eyzat delay correlation, so octane, compression, spark and load all play in. Knock control pulls timing per cylinder.
 - **Torque**: sum of `(p - p_atm) * dV/dtheta` across cylinders minus friction. Pumping losses, cam overlap and spark timing all show up without being special cased.
 - **Turbo**: spool driven by exhaust mass flow, boost limited by the target, simple intercooler.
+- **Pushrod or overhead cam**: the small blocks and the big twin run one cam in the block with lifters, pushrods and rockers. Lobe lift times rocker ratio is valve lift (LS heads are 1.7, an SBC 1.5), and the extra valvetrain weight makes the valves float a little sooner than an OHC with the same springs. Any piston engine can be switched in the Camshaft tab.
 - **Intake inertia**: after BDC the moving charge keeps packing the cylinder, harder the faster it is going. That is what a late closing intake valve cashes in on at high rpm, and why a bigger cam loses a bit down low.
 - **Failures**: rod tension `m r w^2 (1 + r/l)` against rod strength, valve float from spring rate and lift, piston damage from accumulated knock.
 

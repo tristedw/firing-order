@@ -280,6 +280,8 @@ export class Engine {
       this.Vc = this.Vd / (t.compression - 1);
       const maxLift = Math.max(t.inLift, t.exLift);
       this.floatRpm = 6800 * t.springRate * Math.sqrt(10 / maxLift) * Math.sqrt(0.088 / (2 * this.r));
+      // lifter, pushrod and rocker all have to follow the lobe too
+      if (t.valvetrain === 'pushrod') this.floatRpm *= 0.93;
       this.win = { inC: t.inCenterline, inD: t.inDuration, exC: 720 - t.exCenterline, exD: t.exDuration };
     }
     // displacement per 720 of shaft, so a rotary sizes like the piston engine it breathes like

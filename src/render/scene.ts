@@ -7,11 +7,24 @@ import type { Engine, CylState } from '../sim/engine';
 const S = 10;
 const DEG = Math.PI / 180;
 
-export type PartKind = 'piston' | 'rod' | 'crank' | 'intake-valve' | 'exhaust-valve' | 'cam' | 'flywheel' | 'plug' | 'cylinder' | 'rotor';
+export type PartKind = 'piston' | 'rod' | 'crank' | 'intake-valve' | 'exhaust-valve' | 'cam' | 'flywheel' | 'plug' | 'cylinder' | 'rotor' | 'pushrod';
 
 export interface PartHit {
   kind: PartKind;
   cyl: number; // -1 for shared parts
+}
+
+// one side of a pushrod valvetrain: lobe on the block cam, lifter, pushrod, rocker
+interface PushrodSet {
+  dir: THREE.Vector3; // lifter travel, cylinder local
+  base: THREE.Vector3; // where the lifter foot sits on the base circle
+  lifter: THREE.Mesh;
+  pushrod: THREE.Mesh;
+  rocker: THREE.Group;
+  pivot: THREE.Vector3;
+  armIn: number; // pivot to pushrod cup
+  side: number; // +1 or -1 in local z
+  lobeAngle: number; // lobe nose direction at peak lift
 }
 
 interface CylMeshes {
@@ -34,6 +47,7 @@ interface CylMeshes {
   liner: THREE.Mesh;
   deckY: number;
   pinToTop: number;
+  push?: { in: PushrodSet; ex: PushrodSet; group: THREE.Group };
 }
 
 const COL = {
@@ -92,6 +106,7 @@ export class EngineView {
   root = new THREE.Group();
   crank = new THREE.Group();
   flywheel = new THREE.Group();
+  blockCam = new THREE.Group();
   cyls: CylMeshes[] = [];
   rotors: RotorMeshes[] = [];
   shaft = new THREE.Group();
@@ -175,6 +190,7 @@ export class EngineView {
     this.crank = new THREE.Group();
     this.flywheel = new THREE.Group();
     this.shaft = new THREE.Group();
+    this.blockCam = new THREE.Group();
     this.cyls = [];
     this.rotors = [];
     this.pickables = [];
@@ -580,7 +596,11 @@ export class EngineView {
 
       // head: valves, springs, cams
       const valveSide = cd.bank > 0 ? -1 : cd.bank < 0 ? 1 : -1; // intake toward the valley
-      const vz = 0.24 * B;
+      const pushrod = e.tune.valvetrain === 'pushrod';
+      // ohc: valves across the head under their own cams. pushrod: in a row along
+      // the crank like a small block, with the rockers reaching over from the valley side
+      const vz = pushrod ? 0 : 0.24 * B;
+      const vx = pushrod ? 0.21 * B : 0;
       const mkValve = (d: number) => {
         const v = new THREE.Group();
         const headM = new THREE.Mesh(new THREE.CylinderGeometry(d / 2, d / 2 * 0.55, 0.06 * B, 28), mat(COL.valve, 0.9, 0.35));
@@ -595,11 +615,11 @@ export class EngineView {
         return v;
       };
       const inValve = mkValve(e.dIn * S * 0.7);
-      inValve.position.set(0, deckY, valveSide * vz);
+      inValve.position.set(-vx, deckY, valveSide * vz);
       group.add(inValve);
       this.tag(inValve, { kind: 'intake-valve', cyl: i });
       const exValve = mkValve(e.dEx * S * 0.7);
-      exValve.position.set(0, deckY, -valveSide * vz);
+      exValve.position.set(vx, deckY, -valveSide * vz);
       group.add(exValve);
       this.tag(exValve, { kind: 'exhaust-valve', cyl: i });
 
@@ -617,17 +637,19 @@ export class EngineView {
       };
       const springBase = deckY + 0.42 * B;
       const inSpring = mkSpring();
-      inSpring.position.set(0, springBase, valveSide * vz);
+      inSpring.position.set(-vx, springBase, valveSide * vz);
       group.add(inSpring);
       const exSpring = mkSpring();
-      exSpring.position.set(0, springBase, -valveSide * vz);
+      exSpring.position.set(vx, springBase, -valveSide * vz);
       group.add(exSpring);
 
       // cam lobes ride the valve tips
       const camY = deckY + 1.0 * B + 0.05 * B;
+      const ratio = pushrod ? Math.max(1, e.tune.rockerRatio) : 1;
+      const rbLobe = pushrod ? 0.13 * B : 0.17 * B;
       const mkLobe = (dur: number, liftMm: number) => {
-        const rb = 0.17 * B;
-        const lift = (liftMm / 1000) * S;
+        const rb = rbLobe;
+        const lift = (liftMm / ratio / 1000) * S;
         const shape = new THREE.Shape();
         const half = (dur / 4) * DEG; // cam degrees
         for (let k = 0; k <= 96; k++) {
@@ -653,6 +675,60 @@ export class EngineView {
       exLobe.position.set(0, camY + 0.17 * B, -valveSide * vz);
       group.add(exLobe);
       this.tag(exLobe, { kind: 'cam', cyl: i });
+
+      let push: CylMeshes['push'];
+      if (pushrod) {
+        // the cam sits in the block: in the valley for a V, low on the intake side for an inline
+        const camH = r + 0.55 * l;
+        const bk = cd.bank * DEG;
+        const camC = Math.abs(cd.bank) > 5 ? new THREE.Vector3(0, camH * Math.cos(bk), -camH * Math.sin(bk)) : new THREE.Vector3(0, r + 0.45 * l, valveSide * 0.95 * B);
+        const pg = new THREE.Group();
+        const rockerY = deckY + 1.12 * B;
+        const armOut = 0.3 * B; // pivot to valve tip
+        const armIn = armOut / ratio; // pivot to pushrod cup
+        const mkSet = (x: number): PushrodSet => {
+          const pivot = new THREE.Vector3(x, rockerY, valveSide * armOut);
+          const cup = new THREE.Vector3(x, rockerY, valveSide * (armOut + armIn));
+          const at = new THREE.Vector3(x, camC.y, camC.z);
+          const dir = cup.clone().sub(at).normalize();
+          const base = at.clone().addScaledVector(dir, rbLobe);
+          const lifter = new THREE.Mesh(new THREE.CylinderGeometry(0.07 * B, 0.07 * B, 0.32 * B, 16), mat(0x7d848b, 1, 0.3));
+          lifter.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+          pg.add(lifter);
+          const pr = new THREE.Mesh(new THREE.CylinderGeometry(0.022 * B, 0.022 * B, 1, 8), mat(0xa9b0b6, 1, 0.25));
+          pg.add(pr);
+          const rocker = new THREE.Group();
+          const arm = new THREE.Mesh(new THREE.BoxGeometry(0.1 * B, 0.07 * B, armOut + armIn + 0.08 * B), mat(0x8e959c, 1, 0.35));
+          arm.position.z = valveSide * ((armIn - armOut) / 2);
+          rocker.add(arm);
+          const trun = new THREE.Mesh(new THREE.CylinderGeometry(0.05 * B, 0.05 * B, 0.14 * B, 12).rotateZ(Math.PI / 2), mat(COL.steel, 1, 0.25));
+          rocker.add(trun);
+          rocker.position.copy(pivot);
+          pg.add(rocker);
+          const stand = new THREE.Mesh(new THREE.BoxGeometry(0.12 * B, rockerY - deckY - 0.45 * B, 0.1 * B), mat(0x6c737a, 0.8, 0.5));
+          stand.position.set(x, (rockerY + deckY + 0.45 * B) / 2 - 0.04 * B, pivot.z);
+          pg.add(stand);
+          return { dir, base, lifter, pushrod: pr, rocker, pivot, armIn, side: valveSide, lobeAngle: Math.atan2(dir.z, dir.y) };
+        };
+        const pin = mkSet(-vx);
+        const pex = mkSet(vx);
+        // lobes move down to the block cam, each under its own lifter
+        inLobe.position.set(-vx, camC.y, camC.z);
+        exLobe.position.set(vx, camC.y, camC.z);
+        group.add(pg);
+        this.tag(pg, { kind: 'pushrod', cyl: i });
+        push = { in: pin, ex: pex, group: pg };
+        // one cam core for the whole block, built once
+        if (i === 0) {
+          const span = (lay.mains[lay.mains.length - 1] - lay.mains[0]) * B + 0.6 * B;
+          const core = new THREE.Mesh(new THREE.CylinderGeometry(rbLobe * 0.75, rbLobe * 0.75, span, 20).rotateZ(Math.PI / 2), mat(COL.cam, 1, 0.3));
+          const wc = Math.abs(cd.bank) > 5 ? new THREE.Vector3(0, camH, 0) : camC.clone();
+          core.position.set(((lay.mains[0] + lay.mains[lay.mains.length - 1]) / 2) * B, wc.y, wc.z);
+          this.blockCam.add(core);
+          this.root.add(this.blockCam);
+          this.tag(this.blockCam, { kind: 'cam', cyl: -1 });
+        }
+      }
 
       // spark plug
       const plug = new THREE.Group();
@@ -700,7 +776,7 @@ export class EngineView {
       const runner = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3([q0, q1, q2]), 24, 0.15 * B, 12, false), new THREE.MeshStandardMaterial({ color: 0x8d969d, metalness: 0.6, roughness: 0.5, transparent: true, opacity: 0.55 }));
       group.add(runner);
 
-      this.cyls.push({ group, piston, rod, gas, gasMat, inValve, exValve, inSpring, exSpring, inLobe, exLobe, light, plugTip: tip, plugMat, header, headerMat, liner, deckY, pinToTop: ch });
+      this.cyls.push({ group, piston, rod, gas, gasMat, inValve, exValve, inSpring, exSpring, inLobe, exLobe, light, plugTip: tip, plugMat, header, headerMat, liner, deckY, pinToTop: ch, push });
     });
 
     // crankcase, translucent
@@ -777,6 +853,7 @@ export class EngineView {
     }
     if (hit.kind === 'crank') return [this.crank];
     if (hit.kind === 'flywheel') return [this.flywheel];
+    if (hit.kind === 'cam' && hit.cyl < 0) return [this.blockCam, ...this.cyls.flatMap((c) => [c.inLobe, c.exLobe])];
     const c = this.cyls[hit.cyl];
     if (!c) return [];
     switch (hit.kind) {
@@ -790,6 +867,8 @@ export class EngineView {
         return [c.exValve, c.exSpring];
       case 'cam':
         return [c.inLobe, c.exLobe];
+      case 'pushrod':
+        return c.push ? [c.push.group] : [];
       case 'plug':
         return [c.plugTip.parent!];
       default:
@@ -864,8 +943,17 @@ export class EngineView {
       // cam lobe: nose straight down at peak lift
       const inC = e.tune.inCenterline;
       const exC = 720 - e.tune.exCenterline;
-      m.inLobe.rotation.x = Math.PI + ((c.cycle - inC) / 2) * DEG;
-      m.exLobe.rotation.x = Math.PI + ((c.cycle - exC) / 2) * DEG;
+      if (m.push) {
+        // lobe noses point at their lifters at peak lift
+        m.inLobe.rotation.x = m.push.in.lobeAngle + ((c.cycle - inC) / 2) * DEG;
+        m.exLobe.rotation.x = m.push.ex.lobeAngle + ((c.cycle - exC) / 2) * DEG;
+        const ratio = Math.max(1, e.tune.rockerRatio);
+        this.movePushrod(m.push.in, li, ratio, e.B * S);
+        this.movePushrod(m.push.ex, le, ratio, e.B * S);
+      } else {
+        m.inLobe.rotation.x = Math.PI + ((c.cycle - inC) / 2) * DEG;
+        m.exLobe.rotation.x = Math.PI + ((c.cycle - exC) / 2) * DEG;
+      }
 
       // header glow from EGT
       const egtC = c.egt - 273;
@@ -876,6 +964,27 @@ export class EngineView {
       m.gas.visible = !(dead && fl?.kind === 'piston');
       m.piston.children[0] && ((m.piston.children[0] as THREE.Mesh).material as THREE.MeshStandardMaterial).color.setHex(dead && fl?.kind === 'piston' ? 0x4a3f38 : COL.alu);
     });
+  }
+
+  // valve lift at the valve, in scene units. the lobe and lifter see lift / ratio,
+  // the rocker tips the pushrod cup up by the same amount and the valve down by the full lift
+  private movePushrod(p: PushrodSet, lift: number, ratio: number, B: number) {
+    const camLift = lift / ratio;
+    const lifterLen = 0.32 * B;
+    const foot = p.base.clone().addScaledVector(p.dir, camLift);
+    p.lifter.position.copy(foot).addScaledVector(p.dir, lifterLen / 2);
+    const top = foot.clone().addScaledVector(p.dir, lifterLen);
+    const armOut = p.armIn * ratio;
+    const phi = Math.asin(Math.max(-1, Math.min(1, (-lift * p.side) / armOut)));
+    p.rocker.rotation.x = phi;
+    // pushrod cup in local coords after the rocker tips
+    const cz = p.side * p.armIn;
+    const cup = new THREE.Vector3(p.pivot.x, p.pivot.y - cz * Math.sin(phi), p.pivot.z + cz * Math.cos(phi));
+    const v = cup.clone().sub(top);
+    const len = v.length();
+    p.pushrod.position.copy(top).addScaledVector(v, 0.5);
+    p.pushrod.scale.y = len;
+    p.pushrod.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), v.normalize());
   }
 
   render() {
