@@ -523,7 +523,10 @@ export class Engine {
   // Advance the sim by dt seconds of engine time
   // pressure signals for the sound, one value per sim step with its length in seconds.
   // a: left bank header, b: right bank header, c: intake runners
-  audio = { dt: [] as number[], a: [] as number[], b: [] as number[], c: [] as number[] };
+  // tc/ta: a cylinder event on this step. tc is the cylinder, -1 for none, +100 for a backfire. ta its size
+  audio = { dt: [] as number[], a: [] as number[], b: [] as number[], c: [] as number[], tc: [] as number[], ta: [] as number[] };
+  private stepTrig = -1;
+  private stepTrigAmp = 0;
 
   update(dt: number) {
     this.events.length = 0;
@@ -531,6 +534,8 @@ export class Engine {
     this.audio.a.length = 0;
     this.audio.b.length = 0;
     this.audio.c.length = 0;
+    this.audio.tc.length = 0;
+    this.audio.ta.length = 0;
     const t = this.tune;
     let left = dt;
     let elapsed = 0;
@@ -865,10 +870,17 @@ export class Engine {
       if (crossed(wrap720(this.win.exC - this.win.exD / 2))) {
         c.egt = T * 0.62;
         this.events.push({ type: 'exhaust', cyl: c.idx, t: tAt, amp: clamp((p - PATM) / 6e5, 0, 1.6) });
+        this.stepTrig = c.idx;
+        this.stepTrigAmp = clamp((p - PATM) / 6e5, 0, 1.6);
         // raw mixture hits a header still hot from the other cylinders and goes off in the pipe
         if (c.unburnt) {
           c.unburnt = false;
-          if (Math.max(...this.cyls.map((k) => k.egt)) > 650 && Math.random() < 0.3) this.events.push({ type: 'pop', cyl: c.idx, t: tAt + 0.002, amp: 0.4 + Math.random() * 0.6 });
+          if (Math.max(...this.cyls.map((k) => k.egt)) > 650 && Math.random() < 0.3) {
+            const amp = 0.4 + Math.random() * 0.6;
+            this.events.push({ type: 'pop', cyl: c.idx, t: tAt + 0.002, amp });
+            this.stepTrig = c.idx + 100;
+            this.stepTrigAmp = amp;
+          }
         }
       }
 
@@ -1003,6 +1015,9 @@ export class Engine {
     this.audio.a.push(sndA);
     this.audio.b.push(this.layout.cyls.some((cd) => cd.bank > 0) ? sndB : sndA);
     this.audio.c.push(sndC);
+    this.audio.tc.push(this.stepTrig);
+    this.audio.ta.push(this.stepTrigAmp);
+    this.stepTrig = -1;
 
     // manifold filling and emptying
     this.pMan += ((R * Tup) / this.Vman) * (mdotThr - mdotIntakeSum) * h;

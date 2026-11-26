@@ -1,9 +1,8 @@
-// Engine sound. The sim streams header and intake runner pressure at its step rate,
-// the audio thread turns that into flow noise (engine-worklet.ts), and a recorded
-// exhaust impulse response from engine-sim (ange-yaghi/engine-sim, MIT, see
-// public/audio) supplies the pipes and muffler. So every misfire, lope and reversion
-// spike in the sim is what you hear. This side adds turbo whine, BOV, surge, knock
-// ping, the starter and a bit of room.
+// Engine sound. The sim streams header and intake runner pressure plus every exhaust
+// opening and backfire, at its own step rate. The audio thread (engine-worklet.ts) turns
+// that into a firing pulse train through pipe resonators for piston engines, or into
+// flow noise through a recorded exhaust from engine-sim (MIT, see public/audio) for
+// rotaries. This side adds turbo whine, BOV, surge, knock ping, the starter and a room.
 
 import type { Engine, Readings } from '../sim/engine';
 import workletUrl from './engine-worklet.ts?worker&url';
@@ -23,6 +22,7 @@ export class EngineSound {
   private exConv!: ConvolverNode;
   private inConv!: ConvolverNode;
   private exGain!: GainNode;
+  private dryGain!: GainNode;
   private inGain!: GainNode;
   private irs = new Map<string, AudioBuffer>();
   private master!: GainNode;
@@ -154,7 +154,10 @@ export class EngineSound {
     const inLp = c.createBiquadFilter();
     inLp.type = 'lowpass';
     inLp.frequency.value = 2400;
+    this.dryGain = c.createGain();
+    this.dryGain.gain.value = 0;
     this.exConv.connect(this.exGain).connect(hp);
+    this.dryGain.connect(hp);
     this.inConv.connect(inLp).connect(this.inGain).connect(hp);
     hp.connect(this.master);
     hp.connect(this.space);
@@ -172,39 +175,57 @@ export class EngineSound {
     ]).then(() => {
       this.voice = new AudioWorkletNode(c, 'engine-voice', { numberOfInputs: 0, numberOfOutputs: 2, outputChannelCount: [2, 1] });
       this.voice.connect(this.exConv, 0);
+      this.voice.connect(this.dryGain, 0);
       this.voice.connect(this.inConv, 1);
       this.inConv.buffer = this.irs.get('sharp_01') ?? null;
     });
     return this.ready;
   }
 
-  // pick the exhaust for this engine and set how rough the flow noise is
+  // rotaries use the sim's own header flow through a recorded exhaust, everything else
+  // the pulse train and resonators. tune the resonators to the pipes this engine has
   private configure(e: Engine) {
     const v = this.voice;
     if (!v) return;
     const t = e.tune;
     const n = e.layout.cyls.length;
     const rot = e.kind === 'rotary';
-    let ir = 'mild_exhaust';
-    if (t.turbo) ir = 'smooth_39';
-    else if (rot) ir = 'minimal_muffling_01';
-    else if (n === 8 && t.valvetrain === 'pushrod') ir = 'smooth_39';
-    else if (n === 8) ir = 'mild_exhaust_reverb';
-    else if (n <= 2) ir = 'minimal_muffling_02';
-    const key = `${ir}|${rot}|${n}|${e.win.inC}|${e.win.inD}`;
+    const w = e.win;
+    const key = `${t.layout}|${t.turbo}|${t.valvetrain}|${w.inC}|${w.inD}|${w.exC}|${w.exD}`;
     if (key === this.voiceKey) return;
     this.voiceKey = key;
+    const banks = e.layout.cyls.map((c) => (c.bank > 0 ? 1 : 0));
+    const vCyl = e.Vd * 1000;
+    let ir = 'mild_exhaust';
+    if (rot) ir = t.turbo ? 'smooth_39' : 'minimal_muffling_01';
+    else if (t.turbo) ir = 'smooth_39';
+    else if (n === 8) ir = 'mild_exhaust_reverb';
     this.exConv.buffer = this.irs.get(ir) ?? null;
+    const now = this.ctx!.currentTime;
+    this.exGain.gain.setTargetAtTime(rot ? 1.2 : 0.45, now, 0.05);
+    this.dryGain.gain.setTargetAtTime(rot ? 0 : 0.8, now, 0.05);
     // big overlap pushes exhaust back up the intake, that honk is half of a bridgeport
-    const w = e.win;
     const overlap = Math.max(0, w.exC + w.exD / 2 - 720 - (w.inC - w.inD / 2));
-    this.inGain.gain.value = 0.25 + Math.min(1, overlap / 120) * (rot ? 0.9 : 0.4);
+    this.inGain.gain.setTargetAtTime((rot ? 0.2 + Math.min(1, overlap / 120) * 0.9 : 0.04 + Math.min(1, overlap / 120) * 0.08) * 0.4, now, 0.05);
+    // header primaries ring around a quarter wave of their length, the tailpipe much lower
+    const primary = Math.min(1, Math.max(0.35, 0.78 * Math.sqrt(vCyl / 0.65)));
+    const hot = 520;
     v.port.postMessage({
-      type: 'params',
+      type: 'config',
+      mode: rot ? 'flow' : 'ptr',
+      banks,
+      // bigger cylinders blow down slower, a big cam lets go earlier and harder
+      attack: 34 - Math.min(12, vCyl * 8),
+      decay: 2.2 + Math.max(0, (0.8 - vCyl) * 2.5),
+      lambda: n <= 2 ? 0.09 : n === 8 ? 0.13 : 0.11,
+      bend: 0.86,
+      turb: t.turbo ? 0.1 : 0.16,
+      headerHz: hot / (4 * primary),
+      headerFb: t.turbo ? 0.35 : 0.55,
+      tailHz: hot / (4 * (n <= 2 ? 1.0 : 2.2)),
+      tailFb: t.turbo ? 0.3 : 0.5,
       noise: rot ? 0.55 : 0.8,
       df: rot ? 0.02 : 0.012,
-      jitter: rot ? 0.25 : n === 8 ? 0.55 : 0.4,
-      maxGain: 80,
     });
   }
 
@@ -247,18 +268,24 @@ export class EngineSound {
     const live = timeScale > 0.5;
 
     if (this.voice) {
-      this.voice.port.postMessage({ type: 'on', on: rpm > 20 || r.cranking });
+      // engine load drives the turbulence noise, overrun with the fuel cut drives the air rush
+      const tqRef = Math.max(1, e.VdTotal * 1000 * 120);
+      const gThr = Math.pow(Math.max(Math.min(1.5, r.torque / tqRef), 0.02), 0.7);
+      const gDfco = r.fuelCut || (r.throttle < 0.04 && rpm > 1800) ? Math.min(1, rpm / 5000) : 0;
+      this.voice.port.postMessage({ type: 'state', on: rpm > 20 || r.cranking, cps: (rpm / 60) * (360 / e.cycleLen) * timeScale, gThr, gDfco });
       const au = e.audio;
       if (au.dt.length) {
         const dt = Float32Array.from(au.dt);
         const a = Float32Array.from(au.a);
         const b = Float32Array.from(au.b);
         const cc = Float32Array.from(au.c);
-        this.voice.port.postMessage({ type: 'flow', dt, a, b, c: cc, scale: Math.max(timeScale, 0.001) }, [dt.buffer, a.buffer, b.buffer, cc.buffer]);
+        const tc = Float32Array.from(au.tc);
+        const ta = Float32Array.from(au.ta);
+        this.voice.port.postMessage({ type: 'flow', dt, a, b, c: cc, tc, ta, scale: Math.max(timeScale, 0.001) }, [dt.buffer, a.buffer, b.buffer, cc.buffer, tc.buffer, ta.buffer]);
       }
     }
 
-    this.mechGain.gain.setTargetAtTime(live ? (0.002 + Math.min(1, rpm / 7000) * 0.008) * (e.kind === 'rotary' ? 0.25 : e.tune.valvetrain === 'pushrod' ? 1.3 : 1) : 0, now, 0.08);
+    this.mechGain.gain.setTargetAtTime(live ? (0.0006 + Math.min(1, rpm / 7000) * 0.0022) * (e.kind === 'rotary' ? 0.25 : e.tune.valvetrain === 'pushrod' ? 1.3 : 1) : 0, now, 0.08);
     this.mechFilter.frequency.setTargetAtTime(2400 + rpm * 0.25, now, 0.1);
     this.starterGain.gain.setTargetAtTime(r.cranking ? 0.05 : 0, now, 0.03);
     this.starterOsc.frequency.setTargetAtTime(110 + rpm * 0.45, now, 0.05);
@@ -281,11 +308,7 @@ export class EngineSound {
     for (const ev of e.events) {
       const at = base + ev.t / slow;
       if (at > now + 1.5) continue;
-      if (ev.type === 'pop') {
-        // raw mixture lighting in the header: a hard crack
-        this.burst(at, 0.05, 'bandpass', 900, 0.6, 0.14 * ev.amp);
-        this.burst(at, 0.03, 'highpass', 2500, 0.7, 0.05 * ev.amp);
-      } else if (ev.type === 'knock') {
+      if (ev.type === 'knock') {
         const src = ctx.createBufferSource();
         src.buffer = this.ping;
         const g = ctx.createGain();
