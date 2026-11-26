@@ -7,7 +7,7 @@ import type { Engine, CylState } from '../sim/engine';
 const S = 10;
 const DEG = Math.PI / 180;
 
-export type PartKind = 'piston' | 'rod' | 'crank' | 'intake-valve' | 'exhaust-valve' | 'cam' | 'flywheel' | 'plug' | 'cylinder';
+export type PartKind = 'piston' | 'rod' | 'crank' | 'intake-valve' | 'exhaust-valve' | 'cam' | 'flywheel' | 'plug' | 'cylinder' | 'rotor';
 
 export interface PartHit {
   kind: PartKind;
@@ -55,6 +55,35 @@ function mat(color: number, metal = 1, rough = 0.38) {
   return new THREE.MeshStandardMaterial({ color, metalness: metal, roughness: rough });
 }
 
+// fresh charge blue, burnt gas grey, flame on top. shared by piston and rotary
+function gasLook(c: CylState, out: THREE.MeshBasicMaterial) {
+  const fresh = c.m > 0 ? c.mAir / c.m : 0;
+  const col = COL.smoke.clone().lerp(COL.fresh, Math.min(1, fresh * 1.05));
+  const hot = Math.min(1, Math.max(0, (c.T - 700) / 1700));
+  if (hot > 0) col.lerp(COL.flame.clone().lerp(COL.flameHot, hot), Math.min(1, hot * 1.4));
+  if (c.knockFlash > 0) col.lerp(COL.knock, Math.min(1, c.knockFlash * 8));
+  out.color.copy(col);
+  out.opacity = 0.28 + hot * 0.5 + (c.knockFlash > 0 ? 0.2 : 0);
+  return hot;
+}
+
+interface RotorMeshes {
+  group: THREE.Group;
+  rotor: THREE.Group;
+  lobe: THREE.Mesh;
+  chambers: { mesh: THREE.Mesh; mat: THREE.MeshBasicMaterial; pos: THREE.BufferAttribute }[];
+  plugs: THREE.Group;
+  plugMats: THREE.MeshBasicMaterial[];
+  intake: THREE.Group;
+  exhaust: THREE.Mesh;
+  exhaustMat: THREE.MeshStandardMaterial;
+  light: THREE.PointLight;
+  faces: number[]; // sim cylinder index for flank 0, 1, 2
+  phase: number;
+}
+
+const FLANK_N = 20;
+
 export class EngineView {
   renderer: THREE.WebGLRenderer;
   scene = new THREE.Scene();
@@ -64,6 +93,10 @@ export class EngineView {
   crank = new THREE.Group();
   flywheel = new THREE.Group();
   cyls: CylMeshes[] = [];
+  rotors: RotorMeshes[] = [];
+  shaft = new THREE.Group();
+  private R = 1;
+  private ecc = 0.15;
   blockMats: THREE.Material[] = [];
   pickables: THREE.Object3D[] = [];
   selected: PartHit | null = null;
@@ -138,14 +171,294 @@ export class EngineView {
   build(e: Engine) {
     // tear down
     this.root.clear();
+    this.root.position.set(0, 0, 0);
     this.crank = new THREE.Group();
     this.flywheel = new THREE.Group();
+    this.shaft = new THREE.Group();
     this.cyls = [];
+    this.rotors = [];
     this.pickables = [];
     this.blockMats = [];
     this.selected = null;
     this.highlightSaved.clear();
+    if (e.kind === 'rotary') this.buildRotary(e);
+    else this.buildPiston(e);
+    this.finish();
+  }
 
+  private makeFlywheel(fwR: number, B: number, x: number) {
+    const fw = new THREE.Mesh(new THREE.CylinderGeometry(fwR, fwR, 0.22 * B, 64).rotateZ(Math.PI / 2), mat(0x50575d, 1, 0.42));
+    this.flywheel.add(fw);
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(fwR, 0.05 * B, 8, 96).rotateY(Math.PI / 2), mat(0x3c4247, 1, 0.5));
+    this.flywheel.add(ring);
+    const mark = new THREE.Mesh(new THREE.BoxGeometry(0.24 * B, 0.08 * B, 0.3 * B), new THREE.MeshBasicMaterial({ color: 0xd62828 }));
+    mark.position.set(0.01, fwR * 0.86, 0);
+    this.flywheel.add(mark);
+    for (let k = 1; k < 8; k++) {
+      const tick = new THREE.Mesh(new THREE.BoxGeometry(0.235 * B, 0.025 * B, 0.12 * B), new THREE.MeshBasicMaterial({ color: 0xe9ecee }));
+      const a = (k / 8) * Math.PI * 2;
+      tick.position.set(0.01, Math.cos(a) * fwR * 0.88, Math.sin(a) * fwR * 0.88);
+      tick.rotation.x = a;
+      this.flywheel.add(tick);
+    }
+    this.flywheel.position.x = x;
+    this.root.add(this.flywheel);
+    this.tag(this.flywheel, { kind: 'flywheel', cyl: -1 });
+  }
+
+  // housing bore: x = e cos 3t + R cos t, y = e sin 3t + R sin t
+  private housing(t: number, grow = 0) {
+    const R = this.R + grow;
+    return new THREE.Vector2(this.ecc * Math.cos(3 * t) + R * Math.cos(t), this.ecc * Math.sin(3 * t) + R * Math.sin(t));
+  }
+
+  // rotor flank i in the rotor's own frame, s from apex i to apex i+1
+  private flank(i: number, s: number) {
+    const R = this.R;
+    const a0 = (i * 2 * Math.PI) / 3;
+    const a1 = a0 + (2 * Math.PI) / 3;
+    const am = a0 + Math.PI / 3;
+    const x = R * (Math.cos(a0) * (1 - s) + Math.cos(a1) * s) + Math.cos(am) * 0.16 * R * Math.sin(Math.PI * s);
+    const y = R * (Math.sin(a0) * (1 - s) + Math.sin(a1) * s) + Math.sin(am) * 0.16 * R * Math.sin(Math.PI * s);
+    return new THREE.Vector2(x, y);
+  }
+
+  private buildRotary(e: Engine) {
+    const R = e.rotR * S;
+    const ec = e.rotE * S;
+    const b = e.rotB * S;
+    this.R = R;
+    this.ecc = ec;
+    const lay = e.layout;
+    const pitch = b * 1.55;
+    const xs = lay.rotors!.map((r) => (r.x / 1.1) * pitch);
+
+    // e-shaft runs through everything
+    this.root.add(this.shaft);
+    const xMin = Math.min(...xs) - pitch * 0.9;
+    const xMax = Math.max(...xs) + pitch * 0.6;
+    const main = new THREE.Mesh(new THREE.CylinderGeometry(ec * 1.25, ec * 1.25, xMax - xMin, 24).rotateZ(Math.PI / 2), mat(COL.steel, 1, 0.22));
+    main.position.x = (xMin + xMax) / 2;
+    this.shaft.add(main);
+    const pulley = new THREE.Mesh(new THREE.CylinderGeometry(ec * 3, ec * 3, b * 0.25, 32).rotateZ(Math.PI / 2), mat(0x5d6368, 1, 0.45));
+    pulley.position.x = xMax - b * 0.15;
+    this.shaft.add(pulley);
+    this.tag(this.shaft, { kind: 'crank', cyl: -1 });
+
+    const housingPts: THREE.Vector2[] = [];
+    for (let k = 0; k < 120; k++) housingPts.push(this.housing((k / 120) * Math.PI * 2, 0.06));
+
+    lay.rotors!.forEach((rot, ri) => {
+      const g = new THREE.Group();
+      g.position.x = xs[ri];
+      g.rotation.y = Math.PI / 2; // local xy is the rotor plane, local z runs along the shaft
+      this.root.add(g);
+
+      // housing, see-through
+      const outer = new THREE.Shape();
+      for (let k = 0; k <= 120; k++) {
+        const t = (k / 120) * Math.PI * 2;
+        const p = this.housing(t, R * 0.32);
+        if (k === 0) outer.moveTo(p.x * 1.02, p.y);
+        else outer.lineTo(p.x * 1.02, p.y);
+      }
+      outer.holes.push(new THREE.Path(housingPts));
+      const hg = new THREE.ExtrudeGeometry(outer, { depth: b, bevelEnabled: false, curveSegments: 4 });
+      hg.translate(0, 0, -b / 2);
+      const hMat = new THREE.MeshStandardMaterial({ color: COL.block, metalness: 0.4, roughness: 0.5, transparent: true, opacity: 0.16, depthWrite: false, side: THREE.DoubleSide });
+      const housingMesh = new THREE.Mesh(hg, hMat);
+      housingMesh.renderOrder = 3;
+      g.add(housingMesh);
+      this.blockMats.push(hMat);
+
+      // side plate behind it, so the chambers read against something
+      const plateMat = new THREE.MeshStandardMaterial({ color: 0xb9c3cb, metalness: 0.3, roughness: 0.6, transparent: true, opacity: 0.1, depthWrite: false, side: THREE.DoubleSide });
+      const plate = new THREE.Mesh(new THREE.ShapeGeometry(outer), plateMat);
+      plate.position.z = -b / 2 - 0.01;
+      g.add(plate);
+      this.blockMats.push(plateMat);
+
+      // stationary gear on the side housing
+      const sg = new THREE.Mesh(new THREE.CylinderGeometry(2 * ec, 2 * ec, b * 0.14, 36).rotateX(Math.PI / 2), mat(0x7b828a, 1, 0.35));
+      sg.position.z = b * 0.43;
+      g.add(sg);
+
+      // rotor: three flanks, internal ring gear, bearing bore
+      const rotorG = new THREE.Group();
+      const shape = new THREE.Shape();
+      for (let i = 0; i < 3; i++)
+        for (let k = 0; k < FLANK_N; k++) {
+          const p = this.flank(i, k / FLANK_N);
+          if (i === 0 && k === 0) shape.moveTo(p.x, p.y);
+          else shape.lineTo(p.x, p.y);
+        }
+      const bore = new THREE.Path();
+      bore.absarc(0, 0, 3 * ec * 1.06, 0, Math.PI * 2, true);
+      shape.holes.push(bore);
+      const rg = new THREE.ExtrudeGeometry(shape, { depth: b * 0.94, bevelEnabled: false, curveSegments: 24 });
+      rg.translate(0, 0, -b * 0.47);
+      rotorG.add(new THREE.Mesh(rg, mat(0x9aa1a8, 0.9, 0.34)));
+      const ringGear = new THREE.Mesh(new THREE.TorusGeometry(3 * ec, ec * 0.18, 8, 64), mat(0x5b6168, 1, 0.4));
+      ringGear.position.z = b * 0.43;
+      rotorG.add(ringGear);
+      // apex seals
+      for (let i = 0; i < 3; i++) {
+        const a = (i * 2 * Math.PI) / 3;
+        const seal = new THREE.Mesh(new THREE.BoxGeometry(R * 0.05, R * 0.05, b * 0.96), new THREE.MeshStandardMaterial({ color: 0x2b3036, metalness: 0.8, roughness: 0.3 }));
+        seal.position.set(Math.cos(a) * R * 0.985, Math.sin(a) * R * 0.985, 0);
+        seal.rotation.z = a;
+        rotorG.add(seal);
+      }
+      g.add(rotorG);
+      this.tag(rotorG, { kind: 'rotor', cyl: ri * 3 });
+
+      // e-shaft lobe the rotor rides on
+      const lobe = new THREE.Mesh(new THREE.CylinderGeometry(2.6 * ec, 2.6 * ec, b * 0.9, 36).rotateX(Math.PI / 2), mat(COL.steel, 1, 0.25));
+      g.add(lobe);
+      lobe.userData.hit = { kind: 'crank', cyl: -1 };
+      lobe.castShadow = true;
+      this.pickables.push(lobe);
+
+      // the three working chambers between flanks and housing
+      const chambers: RotorMeshes['chambers'] = [];
+      for (let i = 0; i < 3; i++) {
+        const geo = new THREE.BufferGeometry();
+        const pos = new THREE.BufferAttribute(new Float32Array((FLANK_N + 1) * 4 * 3), 3);
+        geo.setAttribute('position', pos);
+        const idx: number[] = [];
+        const row = FLANK_N + 1;
+        for (const side of [0, 2]) {
+          for (let k = 0; k < FLANK_N; k++) {
+            const h0 = side * row + k;
+            const f0 = (side + 1) * row + k;
+            idx.push(h0, f0, h0 + 1, h0 + 1, f0, f0 + 1);
+          }
+        }
+        geo.setIndex(idx);
+        const cm = new THREE.MeshBasicMaterial({ color: COL.fresh, transparent: true, opacity: 0.4, depthWrite: false, side: THREE.DoubleSide });
+        const mesh = new THREE.Mesh(geo, cm);
+        mesh.frustumCulled = false;
+        mesh.renderOrder = 1;
+        g.add(mesh);
+        chambers.push({ mesh, mat: cm, pos });
+      }
+
+      // twin plugs on the bottom minor axis, leading and trailing
+      const plugs = new THREE.Group();
+      const plugMats: THREE.MeshBasicMaterial[] = [];
+      for (const off of [-0.2, 0.2]) {
+        const t = (3 * Math.PI) / 2 + off;
+        const p = this.housing(t, R * 0.05);
+        const plug = new THREE.Group();
+        const ins = new THREE.Mesh(new THREE.CylinderGeometry(R * 0.035, R * 0.035, R * 0.45, 12), new THREE.MeshStandardMaterial({ color: 0xf2f0ea, roughness: 0.25, metalness: 0 }));
+        ins.position.y = -R * 0.3;
+        plug.add(ins);
+        const pm = new THREE.MeshBasicMaterial({ color: 0x5a6064 });
+        const tip = new THREE.Mesh(new THREE.SphereGeometry(R * 0.035, 10, 8), pm);
+        plug.add(tip);
+        plug.position.set(p.x, p.y, 0);
+        plug.rotation.z = t + Math.PI / 2;
+        plugs.add(plug);
+        plugMats.push(pm);
+      }
+      g.add(plugs);
+      this.tag(plugs, { kind: 'plug', cyl: ri * 3 });
+
+      const light = new THREE.PointLight(0xffa040, 0, 3 * R, 1.6);
+      light.position.set(0, -R * 0.75, 0);
+      g.add(light);
+
+      // side intake port and runner, up and to the left of top dead centre
+      const intake = new THREE.Group();
+      const ip = this.housing(Math.PI * 0.72, -R * 0.28);
+      const runnerPts = [new THREE.Vector3(ip.x, ip.y, b * 0.5), new THREE.Vector3(ip.x, ip.y, b * 0.9), new THREE.Vector3(ip.x * 1.4, ip.y + R * 0.6, b * 1.1), new THREE.Vector3(ip.x * 1.5, ip.y + R * 1.3, b * 1.1)];
+      const runner = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(runnerPts), 24, R * 0.13, 12, false), new THREE.MeshStandardMaterial({ color: 0x8d969d, metalness: 0.6, roughness: 0.5, transparent: true, opacity: 0.6 }));
+      intake.add(runner);
+      const portFace = new THREE.Mesh(new THREE.CircleGeometry(R * 0.14, 24), new THREE.MeshBasicMaterial({ color: 0x3d7bea, transparent: true, opacity: 0.5, side: THREE.DoubleSide }));
+      portFace.position.set(ip.x, ip.y, b * 0.505);
+      intake.add(portFace);
+      g.add(intake);
+      this.tag(intake, { kind: 'intake-valve', cyl: ri * 3 });
+
+      // exhaust port, right of top, glows with EGT
+      const t0 = Math.PI * 0.22;
+      const p0 = this.housing(t0, 0.02);
+      const dir = new THREE.Vector2(Math.cos(t0), Math.sin(t0));
+      const exPts = [
+        new THREE.Vector3(p0.x, p0.y, 0),
+        new THREE.Vector3(p0.x + dir.x * R * 0.6, p0.y + dir.y * R * 0.6, 0),
+        new THREE.Vector3(p0.x + dir.x * R * 1.1, p0.y + dir.y * R * 0.3, 0),
+        new THREE.Vector3(p0.x + dir.x * R * 1.2, p0.y - R * 0.8, 0),
+      ];
+      const exMat = new THREE.MeshStandardMaterial({ color: 0x4f4a45, metalness: 0.8, roughness: 0.5, emissive: 0x000000 });
+      const exhaust = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(exPts), 32, R * 0.14, 14, false), exMat);
+      g.add(exhaust);
+      this.tag(exhaust, { kind: 'exhaust-valve', cyl: ri * 3 });
+
+      const faces = [0, 1, 2].map((f) => lay.cyls.findIndex((c) => c.rotor === ri && c.face === f));
+      this.rotors.push({ group: g, rotor: rotorG, lobe, chambers, plugs, plugMats, intake, exhaust, exhaustMat: exMat, light, faces, phase: rot.phase });
+    });
+
+    // flywheel on the far end so the 3/4 view looks into the rotors
+    this.makeFlywheel(R * 1.2, b, xMin - b * 0.1);
+  }
+
+  private updateRotary(e: Engine) {
+    const th = e.theta * DEG;
+    this.shaft.rotation.x = th;
+    this.flywheel.rotation.x = th;
+    const ec = this.ecc;
+    const b = e.rotB * S;
+    for (const rm of this.rotors) {
+      const tr = th + rm.phase * DEG;
+      const rho = tr / 3;
+      const cx = ec * Math.cos(tr);
+      const cy = ec * Math.sin(tr);
+      rm.rotor.position.set(cx, cy, 0);
+      rm.rotor.rotation.z = rho;
+      rm.lobe.position.set(cx, cy, 0);
+      const cr = Math.cos(rho);
+      const sr = Math.sin(rho);
+      let spark = false;
+      let hotMax = 0;
+      let egt = 0;
+      for (let i = 0; i < 3; i++) {
+        const ch = rm.chambers[i];
+        const arr = ch.pos.array as Float32Array;
+        const row = FLANK_N + 1;
+        for (let k = 0; k <= FLANK_N; k++) {
+          const s = k / FLANK_N;
+          const h = this.housing(rho + ((i + s) * 2 * Math.PI) / 3);
+          const f = this.flank(i, s);
+          const fx = cx + f.x * cr - f.y * sr;
+          const fy = cy + f.x * sr + f.y * cr;
+          for (const [side, z] of [[0, b * 0.46], [2, -b * 0.46]] as const) {
+            let o = (side * row + k) * 3;
+            arr[o] = h.x;
+            arr[o + 1] = h.y;
+            arr[o + 2] = z;
+            o = ((side + 1) * row + k) * 3;
+            arr[o] = fx;
+            arr[o + 1] = fy;
+            arr[o + 2] = z;
+          }
+        }
+        ch.pos.needsUpdate = true;
+        const c = e.cyls[rm.faces[i]];
+        if (!c) continue;
+        hotMax = Math.max(hotMax, gasLook(c, ch.mat));
+        if (c.sparkFlash > 0) spark = true;
+        egt = Math.max(egt, c.egt);
+        ch.mesh.visible = !(c.dead && e.failure?.kind === 'piston');
+      }
+      rm.plugMats.forEach((m) => m.color.setHex(spark ? 0xbfe3ff : 0x5a6064));
+      rm.light.intensity = hotMax * 5;
+      const glow = Math.min(1, Math.max(0, (egt - 273 - 520) / 380)) * (e.rpm > 200 ? 1 : 0);
+      rm.exhaustMat.emissive.setRGB(glow * 0.75, glow * 0.12, glow * 0.02);
+    }
+  }
+
+  private buildPiston(e: Engine) {
     const B = e.B * S;
     const r = e.r * S;
     const l = e.l * S;
@@ -203,24 +516,7 @@ export class EngineView {
     this.tag(this.crank, { kind: 'crank', cyl: -1 });
 
     // flywheel with a timing mark, spins with the crank
-    const fwR = r * 2.6 + B * 0.5;
-    const fw = new THREE.Mesh(new THREE.CylinderGeometry(fwR, fwR, 0.22 * B, 64).rotateZ(Math.PI / 2), mat(0x50575d, 1, 0.42));
-    this.flywheel.add(fw);
-    const ring = new THREE.Mesh(new THREE.TorusGeometry(fwR, 0.05 * B, 8, 96).rotateY(Math.PI / 2), mat(0x3c4247, 1, 0.5));
-    this.flywheel.add(ring);
-    const mark = new THREE.Mesh(new THREE.BoxGeometry(0.24 * B, 0.08 * B, 0.3 * B), new THREE.MeshBasicMaterial({ color: 0xd62828 }));
-    mark.position.set(0.01, fwR * 0.86, 0);
-    this.flywheel.add(mark);
-    for (let k = 1; k < 8; k++) {
-      const tick = new THREE.Mesh(new THREE.BoxGeometry(0.235 * B, 0.025 * B, 0.12 * B), new THREE.MeshBasicMaterial({ color: 0xe9ecee }));
-      const a = (k / 8) * Math.PI * 2;
-      tick.position.set(0.01, Math.cos(a) * fwR * 0.88, Math.sin(a) * fwR * 0.88);
-      tick.rotation.x = a;
-      this.flywheel.add(tick);
-    }
-    this.flywheel.position.x = xRear + 0.35 * B;
-    this.root.add(this.flywheel);
-    this.tag(this.flywheel, { kind: 'flywheel', cyl: -1 });
+    this.makeFlywheel(r * 2.6 + B * 0.5, B, xRear + 0.35 * B);
 
     // cylinders
     const ch = 0.42 * B; // wrist pin to crown
@@ -416,7 +712,10 @@ export class EngineView {
     cc.renderOrder = 3;
     this.root.add(cc);
     this.blockMats.push(ccMat);
+    void maxTop;
+  }
 
+  private finish() {
     // set it on the floor and frame it
     const box = new THREE.Box3().setFromObject(this.root);
     const lowest = box.min.y;
@@ -426,7 +725,6 @@ export class EngineView {
     this.radius = Math.max(size.x, size.y, size.z);
     this.controls.target.set(0, size.y * 0.44, 0);
     this.setBlockMode(this.blockMode);
-    void maxTop;
   }
 
   frame(view: 'iso' | 'front' | 'side' | 'top' = 'iso') {
@@ -466,6 +764,17 @@ export class EngineView {
   }
 
   private objectsFor(hit: PartHit): THREE.Object3D[] {
+    if (this.rotors.length) {
+      const rm = this.rotors[Math.max(0, Math.floor(hit.cyl / 3))];
+      if (hit.kind === 'crank') return [this.shaft, ...this.rotors.map((r) => r.lobe)];
+      if (hit.kind === 'flywheel') return [this.flywheel];
+      if (!rm) return [];
+      if (hit.kind === 'rotor') return [rm.rotor];
+      if (hit.kind === 'plug') return [rm.plugs];
+      if (hit.kind === 'intake-valve') return [rm.intake];
+      if (hit.kind === 'exhaust-valve') return [rm.exhaust];
+      return [];
+    }
     if (hit.kind === 'crank') return [this.crank];
     if (hit.kind === 'flywheel') return [this.flywheel];
     const c = this.cyls[hit.cyl];
@@ -505,6 +814,7 @@ export class EngineView {
   }
 
   update(e: Engine) {
+    if (this.rotors.length) return this.updateRotary(e);
     const r = e.r * S;
     const l = e.l * S;
     const th = e.theta * DEG;
@@ -535,14 +845,7 @@ export class EngineView {
       m.gas.scale.y = gasH;
       m.gas.position.y = crown + gasH / 2;
 
-      // gas color: fresh charge blue, burnt gas grey, flame on top
-      const fresh = c.m > 0 ? c.mAir / c.m : 0;
-      const col = COL.smoke.clone().lerp(COL.fresh, Math.min(1, fresh * 1.05));
-      const hot = Math.min(1, Math.max(0, (c.T - 700) / 1700));
-      if (hot > 0) col.lerp(COL.flame.clone().lerp(COL.flameHot, hot), Math.min(1, hot * 1.4));
-      if (c.knockFlash > 0) col.lerp(COL.knock, Math.min(1, c.knockFlash * 8));
-      m.gasMat.color.copy(col);
-      m.gasMat.opacity = 0.28 + hot * 0.5 + (c.knockFlash > 0 ? 0.2 : 0);
+      const hot = gasLook(c, m.gasMat);
 
       m.light.intensity = c.burning ? 6 * hot + 2 : c.knockFlash > 0 ? 8 : hot * 3;
       m.light.color.copy(c.knockFlash > 0 ? COL.knock : COL.flame);

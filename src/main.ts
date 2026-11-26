@@ -80,8 +80,14 @@ presetSel.onchange = () => {
   loadTune(cloneTune(PRESETS[+presetSel.value]));
 };
 
+function applyKnockSensors() {
+  engine.knockControl = tune.knockSensors !== false;
+  $<HTMLInputElement>('knockctl').checked = engine.knockControl;
+}
+
 function loadTune(t: Tune) {
   tune = t;
+  applyKnockSensors();
   engine.ignition = false;
   engine.starter = false;
   engine.stopDyno();
@@ -89,6 +95,7 @@ function loadTune(t: Tune) {
   engine.setTune(tune, true);
   runs = [];
   rebuildView();
+  view.frame('iso');
   panel.sync();
   buildCylinders();
   save();
@@ -245,7 +252,11 @@ helpBtn.onclick = () => {
   helpBtn.setAttribute('aria-expanded', String(!box.hidden));
 };
 
-$<HTMLInputElement>('knockctl').onchange = (e) => (engine.knockControl = (e.target as HTMLInputElement).checked);
+$<HTMLInputElement>('knockctl').onchange = (e) => {
+  engine.knockControl = (e.target as HTMLInputElement).checked;
+  tune.knockSensors = engine.knockControl;
+  save();
+};
 
 const pvBtn = $<HTMLButtonElement>('pvlog');
 pvBtn.onclick = () => {
@@ -328,9 +339,11 @@ function buildCylinders() {
     const pick = document.createElement('button');
     pick.className = 'pick';
     pick.type = 'button';
-    pick.setAttribute('aria-label', `Watch cylinder ${c.idx + 1}`);
+    const label = engine.layout.labels[c.idx];
+    const what = engine.kind === 'rotary' ? 'chamber' : 'cylinder';
+    pick.setAttribute('aria-label', `Watch ${what} ${label}`);
     const num = document.createElement('span');
-    num.textContent = String(c.idx + 1);
+    num.textContent = label;
     const lamp = document.createElement('span');
     lamp.className = 'lamp';
     pick.append(num, lamp);
@@ -345,7 +358,7 @@ function buildCylinders() {
     cut.type = 'button';
     cut.textContent = 'Cut';
     cut.setAttribute('aria-pressed', 'false');
-    cut.setAttribute('aria-label', `Cut spark to cylinder ${c.idx + 1}`);
+    cut.setAttribute('aria-label', `Cut spark to ${what} ${label}`);
     cut.onclick = () => {
       if (engine.killed.has(c.idx)) engine.killed.delete(c.idx);
       else engine.killed.add(c.idx);
@@ -355,7 +368,8 @@ function buildCylinders() {
     cylHost.append(root);
     return { root, lamp, dmg, cut };
   });
-  cylHost.style.gridTemplateColumns = `repeat(${Math.min(4, engine.cyls.length)}, 1fr)`;
+  cylHost.style.gridTemplateColumns = `repeat(${engine.kind === 'rotary' ? 3 : Math.min(4, engine.cyls.length)}, 1fr)`;
+  $('cyl-title').textContent = engine.kind === 'rotary' ? 'Chambers' : 'Cylinders';
 
   const f = $('firing');
   f.innerHTML = '';
@@ -365,7 +379,7 @@ function buildCylinders() {
   f.append(lbl);
   for (const n of engine.layout.firingOrder) {
     const b = document.createElement('b');
-    b.textContent = String(n);
+    b.textContent = engine.layout.labels[n - 1];
     b.dataset.cyl = String(n - 1);
     f.append(b);
   }
@@ -407,14 +421,84 @@ const PART_COPY: Record<PartHit['kind'], [string, string]> = {
   flywheel: ['Flywheel', 'Stores energy between power strokes so the engine keeps turning. The red mark lines up with crankpin 1.'],
   plug: ['Spark plug', 'Fires at the angle from the spark table. Too early and the unburnt gas lights off on its own. That is knock.'],
   cylinder: ['Cylinder', ''],
+  rotor: ['Rotor', 'Three flanks make three chambers. It turns once for every three turns of the e-shaft, kept in step by its ring gear walking round the fixed gear.'],
 };
+
+const ROTARY_COPY: Partial<Record<PartHit['kind'], [string, string]>> = {
+  crank: ['Eccentric shaft', 'The rotor rides the offset lobe and pushes on it like a crankpin. Every rotor fires once per turn of the e-shaft. With the engine off, drag it to turn it by hand.'],
+  'intake-valve': ['Intake port', 'No valves. The rotor uncovers the port as it sweeps past, so the shape of the port is the cam.'],
+  'exhaust-valve': ['Exhaust port', 'Opens as the apex seal passes it on the way to TDC. A peripheral port like this one opens early and gives the lumpy idle.'],
+  plug: ['Spark plugs', 'Leading and trailing plugs fire as a flank passes the narrow waist of the housing.'],
+};
+
+function fillRotary(hit: PartHit) {
+  const rotorIdx = hit.cyl >= 0 ? Math.floor(hit.cyl / 3) : -1;
+  const lay = engine.layout;
+  const faces = rotorIdx >= 0 ? lay.cyls.map((c, i) => ({ c, i })).filter((x) => x.c.rotor === rotorIdx).map((x) => engine.cyls[x.i]) : [];
+  const [title, desc] = ROTARY_COPY[hit.kind] ?? PART_COPY[hit.kind];
+  const named = hit.kind === 'rotor' ? `Rotor ${rotorIdx + 1}` : `${title}, rotor ${rotorIdx + 1}`;
+  $('insp-title').textContent = rotorIdx >= 0 && hit.kind !== 'crank' && hit.kind !== 'flywheel' ? named : title;
+  $('insp-desc').textContent = desc;
+  const rows: [string, string][] = [];
+  const t = tune;
+  const k = engine.kN;
+  const faceRows = () => faces.forEach((c) => rows.push([`Chamber ${lay.labels[c.idx]}`, `${strokeName(c.cycle)}, ${fmt(c.p / 1e5, 1)} bar`]));
+  switch (hit.kind) {
+    case 'rotor': {
+      rows.push(['Rotor angle', `${fmt(((engine.theta + lay.rotors![rotorIdx].phase) / 3) % 360)}°`]);
+      faceRows();
+      rows.push(['Bearing load', `${fmt(engine.rodLoad() / 1000, 1)} kN`]);
+      rows.push(['Rated to', `${fmt(engine.rodRating / 1000, 1)} kN`]);
+      rows.push(['Apex speed', `${fmt((engine.rotR + engine.rotE) * (Math.abs(engine.omega) / 3), 1)} m/s`]);
+      break;
+    }
+    case 'crank': {
+      const [tq, tu] = U.tq(engine.torqueInst);
+      rows.push(['Angle', `${fmt(engine.theta % 360)}°`]);
+      rows.push(['Torque right now', `${fmt(tq)} ${tu}`]);
+      rows.push(['Speed', `${fmt(engine.rpm)} rpm`]);
+      rows.push(['Rotor phasing', lay.rotors!.map((r) => `${r.phase}°`).join(', ')]);
+      break;
+    }
+    case 'intake-valve':
+      rows.push(['Opens', `${t.portIO}° ATDC`]);
+      rows.push(['Closes', `${t.portIC}° ABDC`]);
+      rows.push(['Open to', faces.filter((c) => c.inLift > 0).map((c) => lay.labels[c.idx]).join(', ') || 'nothing']);
+      break;
+    case 'exhaust-valve':
+      rows.push(['Opens', `${t.portEO}° BBDC`]);
+      rows.push(['Closes', t.portEC < 0 ? `${-t.portEC}° BTDC` : `${t.portEC}° ATDC`]);
+      rows.push(['Open to', faces.filter((c) => c.exLift > 0).map((c) => lay.labels[c.idx]).join(', ') || 'nothing']);
+      if (faces[0]) rows.push(['EGT at opening', `${fmt(U.temp(Math.max(...faces.map((c) => c.egt)))[0])} ${U.temp(0)[1]}`]);
+      break;
+    case 'plug': {
+      // whichever flank is coming up to fire next
+      const next = faces.reduce((a, c) => ((((c.sparkAt - c.cycle) % 720) + 720) % 720 < (((a.sparkAt - a.cycle) % 720) + 720) % 720 ? c : a), faces[0]);
+      if (!next) break;
+      rows.push(['Next to fire', lay.labels[next.idx]]);
+      rows.push(['Advance', `${fmt((360 - next.sparkAt) / k, 1)}° BTDC`]);
+      rows.push(['Knock retard', `${fmt(next.knockRetard, 1)}°`]);
+      rows.push(['50% burned at', `${fmt(next.ca50Last / k, 1)}° ATDC`]);
+      rows.push(['Peak pressure', `${fmt(next.peakPLast / 1e5)} bar`]);
+      rows.push(['IMEP', `${fmt(next.imep / 1e5, 1)} bar`]);
+      break;
+    }
+    case 'flywheel':
+      rows.push(['Inertia', `${fmt(engine.J, 3)} kg m²`]);
+      rows.push(['Speed', `${fmt(engine.rpm)} rpm`]);
+      rows.push(['Stored energy', `${fmt((0.5 * engine.J * engine.omega * engine.omega) / 1000, 1)} kJ`]);
+      break;
+  }
+  $('insp-data').innerHTML = rows.map(([a, b]) => `<dt>${a}</dt><dd>${b}</dd>`).join('');
+}
 
 function fillInspector() {
   if (!inspected) return;
   const hit = inspected;
+  if (engine.kind === 'rotary') return fillRotary(hit);
   const c = hit.cyl >= 0 ? engine.cyls[hit.cyl] : null;
   const [title, desc] = PART_COPY[hit.kind];
-  $('insp-title').textContent = c ? `${title}, cylinder ${c.idx + 1}` : title;
+  $('insp-title').textContent = c ? `${title}, cylinder ${engine.layout.labels[c.idx]}` : title;
   $('insp-desc').textContent = desc;
   const rows: [string, string][] = [];
   const ev = engine.valveEvents();
@@ -625,6 +709,7 @@ function updateReadouts() {
   readEls.egt.innerHTML = `${fmt(eg)}<small>${egu}</small>`;
   const rodPct = (r.rodLoad / r.rodRating) * 100;
   readEls.rod.innerHTML = `${fmt(rodPct)}<small>% of rating</small>`;
+  (readEls.rod.previousElementSibling as HTMLElement).textContent = engine.kind === 'rotary' ? 'Rotor load' : 'Rod load';
   readEls.rod.dataset.warn = String(rodPct > 85);
 
   // status
@@ -656,7 +741,7 @@ function updateReadouts() {
   });
 
   const c = engine.cyls[engine.watch];
-  if (c) $('pt-note').textContent = `Cylinder ${engine.watch + 1}, peak ${fmt(c.peakPLast / 1e5)} bar, IMEP ${fmt(c.imep / 1e5, 1)} bar`;
+  if (c) $('pt-note').textContent = `${engine.kind === 'rotary' ? 'Chamber' : 'Cylinder'} ${engine.layout.labels[engine.watch]}, peak ${fmt(c.peakPLast / 1e5)} bar, IMEP ${fmt(c.imep / 1e5, 1)} bar`;
 
   panel.updateDerived({ floatRpm: engine.floatRpm, rodRpm: rodLimitRpm() });
   panel.tick();
@@ -664,11 +749,20 @@ function updateReadouts() {
 
   if (engine.failure && $('failure').hidden) {
     const f = engine.failure;
-    const what = {
-      rod: `A rod let go in cylinder ${f.cyl + 1} at ${fmt(f.rpm)} rpm. The inertia load passed what the rod was built for.`,
-      valve: `Valve float at ${fmt(f.rpm)} rpm let a valve kiss the piston in cylinder ${f.cyl + 1}. It is bent and the cylinder is dead.`,
-      piston: `Detonation burned a hole through the piston in cylinder ${f.cyl + 1}. Pull some timing or run better fuel.`,
-    }[f.kind];
+    const lbl = engine.layout.labels[f.cyl];
+    const rotor = Math.floor(f.cyl / 3) + 1;
+    const what =
+      engine.kind === 'rotary'
+        ? {
+            rod: `Rotor ${rotor} spun its bearing at ${fmt(f.rpm)} rpm. The orbiting rotor pulled harder than the bearing was rated for.`,
+            valve: `Something let go at ${fmt(f.rpm)} rpm.`,
+            piston: `Detonation cracked an apex seal on chamber ${lbl}. The chamber has no compression now. Pull some timing or run better fuel.`,
+          }[f.kind]
+        : {
+            rod: `A rod let go in cylinder ${lbl} at ${fmt(f.rpm)} rpm. The inertia load passed what the rod was built for.`,
+            valve: `Valve float at ${fmt(f.rpm)} rpm let a valve kiss the piston in cylinder ${lbl}. It is bent and the cylinder is dead.`,
+            piston: `Detonation burned a hole through the piston in cylinder ${lbl}. Pull some timing or run better fuel.`,
+          }[f.kind];
     $('failure-text').textContent = what;
     $('failure').hidden = false;
   }
@@ -745,6 +839,7 @@ window.addEventListener('resize', () => {
 new ResizeObserver(() => view.resize()).observe(gl);
 
 buildCylinders();
+applyKnockSensors();
 updateReadouts();
 drawDynoNow();
 requestAnimationFrame(frame);

@@ -28,6 +28,17 @@ export interface Tune {
   flywheel: number; // inertia multiplier
   recipMass: number; // grams, piston + pin + rings + small end
   rodStrength: number; // kN of inertial tension the rods survive
+  tbMm: number; // throttle body bore, 0 = size it from displacement
+  knockSensors: boolean;
+  // rotary only, mm and e-shaft deg
+  rotorR: number; // generating radius
+  rotorE: number; // eccentricity
+  rotorB: number; // rotor width
+  portIO: number; // intake opens ATDC
+  portIC: number; // intake closes ABDC
+  portEO: number; // exhaust opens BBDC
+  portEC: number; // exhaust closes ATDC (negative = BTDC)
+  notes?: string;
 }
 
 export function makeSpark(peak: number, lowRpmBase: number, loadPull: number, knee = 3500): number[][] {
@@ -61,6 +72,15 @@ const base: Omit<Tune, 'name' | 'layout' | 'bore' | 'stroke' | 'rod'> = {
   flywheel: 1,
   recipMass: 520,
   rodStrength: 20,
+  tbMm: 0,
+  knockSensors: true,
+  rotorR: 105,
+  rotorE: 15,
+  rotorB: 80,
+  portIO: 3,
+  portIC: 65,
+  portEO: 50,
+  portEC: -3,
 };
 
 export const PRESETS: Tune[] = [
@@ -83,6 +103,61 @@ export const PRESETS: Tune[] = [
     idleRpm: 700,
     spark: makeSpark(36, 14, 12),
     recipMass: 640,
+  },
+  {
+    ...base,
+    name: 'Tahoe LM7 (MTC8)',
+    layout: 'v8-ls',
+    bore: 96.0,
+    stroke: 92.0,
+    rod: 154.9,
+    compression: 9.5,
+    // Melling MTC-8: 274/280 adv, 212/218 @ .050, .522/.529, 114 LSA, in 4 deg advanced
+    inDuration: 274,
+    exDuration: 280,
+    inCenterline: 110,
+    exCenterline: 118,
+    inLift: 13.26,
+    exLift: 13.44,
+    springRate: 1.15,
+    runner: 470,
+    tbMm: 78,
+    afrCruise: 14.7,
+    afrWot: 12.6,
+    octane: 87,
+    knockSensors: false,
+    revLimit: 6000,
+    idleRpm: 700,
+    spark: makeSpark(36, 16, 13, 4000),
+    flywheel: 1.25,
+    recipMass: 700,
+    notes: '2004 Tahoe 5.3 LM7. Melling MTC-8 cam, cold air intake, headers, 78 mm drive by wire throttle body. 87 octane, no knock sensors so knock control is off and the spark table is all you get. SM465 manual, so a heavier flywheel.',
+  },
+  {
+    ...base,
+    name: 'LM7 stock cam',
+    layout: 'v8-ls',
+    bore: 96.0,
+    stroke: 92.0,
+    rod: 154.9,
+    compression: 9.5,
+    // 2000 to 2007 LM7: 190/191 @ .050, .457/.466, 114 LSA, 112/116
+    inDuration: 252,
+    exDuration: 254,
+    inCenterline: 112,
+    exCenterline: 116,
+    inLift: 11.6,
+    exLift: 11.84,
+    runner: 470,
+    tbMm: 78,
+    afrWot: 12.6,
+    octane: 87,
+    revLimit: 6000,
+    idleRpm: 600,
+    spark: makeSpark(38, 16, 13, 4000),
+    flywheel: 1.25,
+    recipMass: 700,
+    notes: 'Factory 2004 LM7 for comparison. Run a pull here, then switch to the MTC8 tune and pull again to see the cam swap on the dyno.',
   },
   {
     ...base,
@@ -210,6 +285,77 @@ export const PRESETS: Tune[] = [
   },
   {
     ...base,
+    name: '13B Renesis',
+    bore: 86,
+    stroke: 86,
+    rod: 143,
+    layout: 'rotary-2',
+    compression: 10,
+    rotorR: 105,
+    rotorE: 15,
+    rotorB: 80,
+    portIO: 3,
+    portIC: 65,
+    portEO: 50,
+    portEC: -3,
+    octane: 91,
+    revLimit: 9000,
+    idleRpm: 900,
+    runner: 220,
+    flywheel: 1.1,
+    spark: makeSpark(30, 10, 8, 5000),
+    afrWot: 12.2,
+    recipMass: 4600,
+    notes: 'RX-8 high power 13B-MSP. Side intake and side exhaust ports, so almost no overlap. Spark and port timing are in e-shaft degrees.',
+  },
+  {
+    ...base,
+    name: '13B-REW twin turbo',
+    bore: 86,
+    stroke: 86,
+    rod: 143,
+    layout: 'rotary-2',
+    compression: 9.0,
+    portIO: 32,
+    portIC: 50,
+    portEO: 75,
+    portEC: 48,
+    boost: 10,
+    afrWot: 11.3,
+    octane: 94,
+    revLimit: 8000,
+    idleRpm: 800,
+    runner: 260,
+    flywheel: 1.1,
+    spark: makeSpark(26, 8, 6, 4500),
+    recipMass: 4600,
+    notes: 'FD RX-7. Peripheral exhaust port gives the long overlap and the lumpy idle. Spark and port timing are in e-shaft degrees.',
+  },
+  {
+    ...base,
+    name: '20B three rotor',
+    bore: 86,
+    stroke: 86,
+    rod: 143,
+    layout: 'rotary-3',
+    compression: 9.0,
+    portIO: 32,
+    portIC: 50,
+    portEO: 75,
+    portEC: 48,
+    boost: 4,
+    afrWot: 11.4,
+    octane: 94,
+    revLimit: 7500,
+    idleRpm: 850,
+    runner: 260,
+    flywheel: 1.1,
+    spark: makeSpark(26, 8, 6, 4500),
+    recipMass: 4600,
+    notes: 'Cosmo 20B. Three rotors 120 deg apart on the e-shaft, so it fires every 120 deg like a V12.',
+  },
+  {
+    ...base,
     name: 'Mower single',
     layout: 'single',
     bore: 68,
@@ -232,12 +378,17 @@ export const PRESETS: Tune[] = [
   },
 ];
 
-// stock rods get roughly 18% over the factory limiter before they let go
+// stock rods (or rotor bearings) get roughly 18% over the factory limiter
 for (const p of PRESETS) {
-  const r = p.stroke / 2000;
-  const l = p.rod / 1000;
   const w = ((p.revLimit * 1.18) * 2 * Math.PI) / 60;
-  p.rodStrength = Math.round(((p.recipMass / 1000) * r * w * w * (1 + r / l)) / 100) / 10;
+  const m = p.recipMass / 1000;
+  if (p.layout.startsWith('rotary')) {
+    p.rodStrength = Math.round((m * (p.rotorE / 1000) * w * w) / 100) / 10;
+  } else {
+    const r = p.stroke / 2000;
+    const l = p.rod / 1000;
+    p.rodStrength = Math.round((m * r * w * w * (1 + r / l)) / 100) / 10;
+  }
 }
 
 export function cloneTune(t: Tune): Tune {

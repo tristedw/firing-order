@@ -1,7 +1,7 @@
 import { LAYOUTS, type LayoutId } from '../sim/layouts';
 import { SPARK_MAP, SPARK_RPM, makeSpark, type Tune } from '../sim/tune';
 
-type NumKey = { [K in keyof Tune]: Tune[K] extends number ? K : never }[keyof Tune];
+type NumKey = Exclude<{ [K in keyof Tune]-?: Tune[K] extends number ? K : never }[keyof Tune], undefined>;
 
 interface Field {
   key: NumKey;
@@ -11,21 +11,25 @@ interface Field {
   max: number;
   step: number;
   hint?: string;
-  geometry?: boolean;
+  only?: 'piston' | 'rotary';
 }
 
-export const GEOMETRY_KEYS = new Set<keyof Tune>(['layout', 'bore', 'stroke', 'rod', 'compression', 'inDuration', 'exDuration', 'inLift', 'exLift']);
+export const GEOMETRY_KEYS = new Set<keyof Tune>(['layout', 'bore', 'stroke', 'rod', 'compression', 'inDuration', 'exDuration', 'inLift', 'exLift', 'rotorR', 'rotorE', 'rotorB']);
 
 const GROUPS: { id: string; name: string; fields: Field[] }[] = [
   {
     id: 'engine',
     name: 'Bottom end',
     fields: [
-      { key: 'bore', label: 'Bore', unit: 'mm', min: 50, max: 115, step: 0.1 },
-      { key: 'stroke', label: 'Stroke', unit: 'mm', min: 40, max: 120, step: 0.1 },
-      { key: 'rod', label: 'Rod length', unit: 'mm', min: 80, max: 200, step: 0.5, hint: 'Center to center. Longer rods mean less side load and a gentler piston dwell at TDC.' },
+      { key: 'bore', label: 'Bore', unit: 'mm', min: 50, max: 115, step: 0.1, only: 'piston' },
+      { key: 'stroke', label: 'Stroke', unit: 'mm', min: 40, max: 120, step: 0.1, only: 'piston' },
+      { key: 'rod', label: 'Rod length', unit: 'mm', min: 80, max: 200, step: 0.5, only: 'piston', hint: 'Center to center. Longer rods mean less side load and a gentler piston dwell at TDC.' },
+      { key: 'rotorR', label: 'Generating radius', unit: 'mm', min: 70, max: 130, step: 0.5, only: 'rotary', hint: 'Rotor center to apex. Sets the size of the housing.' },
+      { key: 'rotorE', label: 'Eccentricity', unit: 'mm', min: 10, max: 22, step: 0.1, only: 'rotary', hint: 'Offset of the e-shaft lobe. Chamber volume scales with it directly.' },
+      { key: 'rotorB', label: 'Rotor width', unit: 'mm', min: 50, max: 110, step: 0.5, only: 'rotary' },
       { key: 'compression', label: 'Compression', unit: ':1', min: 6, max: 15, step: 0.1 },
-      { key: 'recipMass', label: 'Piston and pin mass', unit: 'g', min: 120, max: 1000, step: 5, hint: 'Sets rod load. Heavy parts break rods at lower rpm.' },
+      { key: 'recipMass', label: 'Piston and pin mass', unit: 'g', min: 120, max: 1000, step: 5, only: 'piston', hint: 'Sets rod load. Heavy parts break rods at lower rpm.' },
+      { key: 'recipMass', label: 'Rotor mass', unit: 'g', min: 2000, max: 8000, step: 50, only: 'rotary', hint: 'The rotor orbits on the e-shaft lobe, so its weight loads the bearing every revolution.' },
       { key: 'flywheel', label: 'Flywheel', unit: '×', min: 0.3, max: 3, step: 0.05, hint: 'Rotating inertia. Light revs fast, heavy idles smooth.' },
     ],
   },
@@ -33,13 +37,17 @@ const GROUPS: { id: string; name: string; fields: Field[] }[] = [
     id: 'cam',
     name: 'Camshaft',
     fields: [
-      { key: 'inDuration', label: 'Intake duration', unit: '°', min: 180, max: 320, step: 1 },
-      { key: 'exDuration', label: 'Exhaust duration', unit: '°', min: 180, max: 320, step: 1 },
-      { key: 'inCenterline', label: 'Intake centerline', unit: '° ATDC', min: 90, max: 130, step: 0.5, hint: 'Lower numbers advance the cam: torque moves down the rev range.' },
-      { key: 'exCenterline', label: 'Exhaust centerline', unit: '° BTDC', min: 90, max: 130, step: 0.5 },
-      { key: 'inLift', label: 'Intake lift', unit: 'mm', min: 4, max: 17, step: 0.1 },
-      { key: 'exLift', label: 'Exhaust lift', unit: 'mm', min: 4, max: 17, step: 0.1 },
-      { key: 'springRate', label: 'Valve springs', unit: '×', min: 0.6, max: 2, step: 0.05, hint: 'Stiffer springs push valve float higher.' },
+      { key: 'inDuration', label: 'Intake duration', unit: '°', min: 180, max: 320, step: 1, only: 'piston' },
+      { key: 'exDuration', label: 'Exhaust duration', unit: '°', min: 180, max: 320, step: 1, only: 'piston' },
+      { key: 'inCenterline', label: 'Intake centerline', unit: '° ATDC', min: 90, max: 130, step: 0.5, only: 'piston', hint: 'Lower numbers advance the cam: torque moves down the rev range.' },
+      { key: 'exCenterline', label: 'Exhaust centerline', unit: '° BTDC', min: 90, max: 130, step: 0.5, only: 'piston' },
+      { key: 'inLift', label: 'Intake lift', unit: 'mm', min: 4, max: 17, step: 0.1, only: 'piston' },
+      { key: 'exLift', label: 'Exhaust lift', unit: 'mm', min: 4, max: 17, step: 0.1, only: 'piston' },
+      { key: 'springRate', label: 'Valve springs', unit: '×', min: 0.6, max: 2, step: 0.05, only: 'piston', hint: 'Stiffer springs push valve float higher.' },
+      { key: 'portIO', label: 'Intake opens', unit: '° ATDC', min: -10, max: 60, step: 1, only: 'rotary', hint: 'E-shaft degrees. Porting a rotary is the same game as picking a cam: open earlier and close later for top end.' },
+      { key: 'portIC', label: 'Intake closes', unit: '° ABDC', min: 20, max: 100, step: 1, only: 'rotary' },
+      { key: 'portEO', label: 'Exhaust opens', unit: '° BBDC', min: 30, max: 100, step: 1, only: 'rotary' },
+      { key: 'portEC', label: 'Exhaust closes', unit: '° ATDC', min: -10, max: 70, step: 1, only: 'rotary', hint: 'Negative means before TDC. Peripheral exhaust ports close late and overlap with the intake.' },
     ],
   },
   {
@@ -50,6 +58,7 @@ const GROUPS: { id: string; name: string; fields: Field[] }[] = [
       { key: 'afrWot', label: 'AFR at full throttle', unit: ':1', min: 10, max: 18, step: 0.1, hint: 'Best power is a bit rich, around 12.5 to 13.' },
       { key: 'octane', label: 'Fuel octane', unit: 'AKI', min: 80, max: 110, step: 1 },
       { key: 'runner', label: 'Intake runner', unit: 'mm', min: 100, max: 600, step: 5 },
+      { key: 'tbMm', label: 'Throttle body', unit: 'mm', min: 0, max: 120, step: 1, hint: '0 sizes it from displacement.' },
       { key: 'boost', label: 'Turbo boost', unit: 'psi', min: 0, max: 30, step: 0.5, hint: '0 for naturally aspirated.' },
     ],
   },
@@ -59,7 +68,8 @@ const GROUPS: { id: string; name: string; fields: Field[] }[] = [
     fields: [
       { key: 'revLimit', label: 'Rev limiter', unit: 'rpm', min: 2000, max: 12000, step: 50 },
       { key: 'idleRpm', label: 'Idle target', unit: 'rpm', min: 500, max: 2000, step: 10 },
-      { key: 'rodStrength', label: 'Rod strength', unit: 'kN', min: 4, max: 60, step: 0.5, hint: 'How much inertial pull the rods take before one snaps. Forged rods buy you rpm.' },
+      { key: 'rodStrength', label: 'Rod strength', unit: 'kN', min: 4, max: 60, step: 0.5, only: 'piston', hint: 'How much inertial pull the rods take before one snaps. Forged rods buy you rpm.' },
+      { key: 'rodStrength', label: 'Rotor bearing rating', unit: 'kN', min: 20, max: 160, step: 1, only: 'rotary', hint: 'Load the rotor bearing takes from the rotor orbiting the e-shaft.' },
     ],
   },
 ];
@@ -70,7 +80,9 @@ export interface PanelHooks {
 }
 
 export class TunePanel {
-  private inputs = new Map<NumKey, { num: HTMLInputElement; range: HTMLInputElement }>();
+  private inputs: { f: Field; num: HTMLInputElement; range: HTMLInputElement; row: HTMLElement }[] = [];
+  private notesEl!: HTMLElement;
+  private sparkNote!: HTMLElement;
   private layoutSel!: HTMLSelectElement;
   private derived = new Map<string, HTMLElement>();
   private cells: HTMLElement[][] = [];
@@ -107,6 +119,8 @@ export class TunePanel {
 
     const body = el('div', 'tab-body');
     this.host.append(body);
+    this.notesEl = el('p', 'tune-notes');
+    body.append(this.notesEl);
 
     for (const g of GROUPS) {
       const sec = el('section', 'pane');
@@ -153,7 +167,7 @@ export class TunePanel {
   private fieldRow(f: Field) {
     const row = el('div', 'field');
     const top = el('div', 'field-top');
-    const id = `f-${f.key}`;
+    const id = `f-${f.key}${f.only ? `-${f.only}` : ''}`;
     const lab = text('label', 'field-label', f.label) as HTMLLabelElement;
     lab.htmlFor = id;
     const numWrap = el('span', 'num');
@@ -182,7 +196,7 @@ export class TunePanel {
     num.onchange = () => apply(+num.value);
     row.append(top, range);
     if (f.hint) row.append(text('p', 'hint', f.hint));
-    this.inputs.set(f.key, { num, range });
+    this.inputs.push({ f, num, range, row });
     return row;
   }
 
@@ -216,7 +230,8 @@ export class TunePanel {
   private sparkPane() {
     const sec = el('section', 'pane');
     sec.dataset.pane = 'spark';
-    sec.append(text('p', 'hint', 'Ignition advance in degrees before TDC. Rows are manifold pressure, columns are rpm. The outlined cell is where the engine is running right now.'));
+    this.sparkNote = text('p', 'hint', '');
+    sec.append(this.sparkNote);
     const wrap = el('div', 'spark-wrap');
     const table = el('div', 'spark-table');
     table.style.gridTemplateColumns = `auto repeat(${SPARK_RPM.length}, 1fr)`;
@@ -395,8 +410,19 @@ export class TunePanel {
 
   sync() {
     const t = this.tune();
+    const kind = LAYOUTS[t.layout].kind;
     this.layoutSel.value = t.layout;
-    for (const [k, { num, range }] of this.inputs) {
+    this.notesEl.textContent = t.notes ?? '';
+    this.notesEl.hidden = !t.notes;
+    const camTab = this.host.querySelector<HTMLElement>('.tab[data-tab="cam"]');
+    if (camTab) camTab.textContent = kind === 'rotary' ? 'Ports' : 'Camshaft';
+    this.sparkNote.textContent =
+      kind === 'rotary'
+        ? 'Ignition advance in e-shaft degrees before TDC. Rows are manifold pressure, columns are rpm. The outlined cell is where the engine is running right now.'
+        : 'Ignition advance in degrees before TDC. Rows are manifold pressure, columns are rpm. The outlined cell is where the engine is running right now.';
+    for (const { f, num, range, row } of this.inputs) {
+      row.hidden = !!f.only && f.only !== kind;
+      const k = f.key;
       const v = t[k] as number;
       if (document.activeElement !== num) num.value = String(+v.toFixed(2));
       range.value = String(v);
@@ -409,12 +435,40 @@ export class TunePanel {
 
   updateDerived(extra?: { floatRpm: number; rodRpm: number }) {
     const t = this.tune();
-    const n = LAYOUTS[t.layout].cyls.length;
-    const disp = (Math.PI / 4) * (t.bore / 10) ** 2 * (t.stroke / 10) * n;
+    const lay = LAYOUTS[t.layout];
+    const n = lay.cyls.length;
     const set = (k: string, v: string) => {
       const e = this.derived.get(k);
       if (e) e.textContent = v;
     };
+    const show = (k: string, on: boolean) => {
+      const e = this.derived.get(k);
+      if (e) {
+        e.hidden = !on;
+        (e.previousElementSibling as HTMLElement).hidden = !on;
+      }
+    };
+    if (lay.kind === 'rotary') {
+      const face = 3 * Math.sqrt(3) * t.rotorE * t.rotorR * t.rotorB / 1000; // cc
+      const rotors = lay.rotors!.length;
+      set('disp', `${rotors} x ${Math.round(face)} cc`);
+      set('rs', '');
+      set('ps', `${(((t.rotorR + t.rotorE) / 1000) * (t.revLimit / 3) * (Math.PI / 30)).toFixed(1)} m/s`);
+      set('lsa', '');
+      set('overlap', `${Math.max(0, t.portEC - t.portIO)}°`);
+      set('ivc', `${t.portIC}° ABDC`);
+      for (const k of ['rs', 'lsa', 'float', 'float2']) show(k, false);
+      (this.derived.get('ps')?.previousElementSibling as HTMLElement).textContent = 'Apex speed at limiter';
+      (this.derived.get('rodlim')?.previousElementSibling as HTMLElement).textContent = 'Rotor bearing lets go near';
+      set('lambda', (t.afrWot / 14.7).toFixed(2));
+      set('tuned', `${Math.round(1.9e6 / t.runner / 50) * 50} rpm`);
+      if (extra) set('rodlim', `${Math.round(extra.rodRpm / 10) * 10} rpm`);
+      return;
+    }
+    for (const k of ['rs', 'lsa', 'float', 'float2']) show(k, true);
+    (this.derived.get('ps')?.previousElementSibling as HTMLElement).textContent = 'Piston speed at limiter';
+    (this.derived.get('rodlim')?.previousElementSibling as HTMLElement).textContent = 'Rods let go near';
+    const disp = (Math.PI / 4) * (t.bore / 10) ** 2 * (t.stroke / 10) * n;
     set('disp', `${(disp / 1000).toFixed(2)} L, ${Math.round(disp / 16.387)} ci`);
     set('rs', (t.rod / t.stroke).toFixed(2));
     set('ps', `${((2 * t.stroke * t.revLimit) / 60000).toFixed(1)} m/s`);

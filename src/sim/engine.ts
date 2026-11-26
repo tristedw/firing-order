@@ -4,7 +4,7 @@
 // Woschni, knock is a Livengood-Wu integral on the end gas. Torque falls out of
 // p * dV/dtheta so pumping losses, cam timing and spark all show up naturally.
 
-import { LAYOUTS, firingAngles, type LayoutDef } from './layouts';
+import { LAYOUTS, cycleLength, firingAngles, type EngineKind, type LayoutDef } from './layouts';
 import { lookupSpark, type Tune } from './tune';
 
 export const PATM = 101325;
@@ -35,7 +35,7 @@ export interface EngineEvent {
 export interface CylState {
   idx: number;
   tdc: number; // crank angle of compression TDC
-  cycle: number; // 0..720, 0 = overlap TDC, 360 = firing TDC
+  cycle: number; // 0..720 normalised, 0 = overlap TDC, 360 = firing TDC (rotary: e-shaft deg x 2/3)
   psi: number; // crank angle relative to this cylinder axis, deg
   x: number; // piston distance down from TDC, m
   vel: number; // m/s
@@ -137,12 +137,29 @@ function orifice(cdA: number, p1: number, T1: number, p2: number, T2: number): n
   return (sign * cdA * pu * psi) / Math.sqrt(R * Tu);
 }
 
+// valve or port windows in normalised cycle degrees
+interface Windows {
+  inC: number;
+  inD: number;
+  exC: number;
+  exD: number;
+}
+
 export class Engine {
   tune!: Tune;
   layout!: LayoutDef;
+  kind: EngineKind = 'piston';
+  cycleLen = 720; // shaft degrees per full cycle
+  kN = 1; // shaft deg to normalised cycle deg
+  win: Windows = { inC: 108, inD: 250, exC: 606, exD: 254 };
   cyls: CylState[] = [];
 
   // geometry, SI
+  rotR = 0.105;
+  rotE = 0.015;
+  rotB = 0.08;
+  portInMax = 0;
+  portExMax = 0;
   B = 0.1;
   r = 0.044;
   l = 0.145;
@@ -159,7 +176,7 @@ export class Engine {
   rodRating = 24000;
 
   // state
-  theta = 0; // crank deg 0..720
+  theta = 0; // crank or e-shaft deg, 0..cycleLen
   omega = 0; // rad/s
   pMan = PATM;
   spool = 0;
@@ -224,25 +241,59 @@ export class Engine {
     const layoutChanged = !this.tune || this.tune.layout !== t.layout;
     this.tune = t;
     this.layout = LAYOUTS[t.layout];
-    this.B = t.bore / 1000;
-    this.r = t.stroke / 2000;
-    this.l = Math.max(t.rod / 1000, this.r * 2.2);
-    this.A = (Math.PI * this.B * this.B) / 4;
-    this.Vd = this.A * 2 * this.r;
-    this.Vc = this.Vd / (t.compression - 1);
+    this.kind = this.layout.kind;
+    this.cycleLen = cycleLength(this.layout);
+    this.kN = 720 / this.cycleLen;
     const n = this.layout.cyls.length;
-    this.VdTotal = this.Vd * n;
+    if (this.kind === 'rotary') {
+      this.rotR = t.rotorR / 1000;
+      this.rotE = Math.min(t.rotorE, t.rotorR / 5) / 1000;
+      this.rotB = t.rotorB / 1000;
+      // chamber displacement of one flank: 3 sqrt3 e R b
+      this.Vd = 3 * Math.sqrt(3) * this.rotE * this.rotR * this.rotB;
+      this.Vc = this.Vd / (t.compression - 1);
+      // stand-ins so the shared heat loss and flow sizing have something to chew on
+      this.B = Math.cbrt((4 * this.Vd) / Math.PI);
+      this.A = (Math.PI * this.B * this.B) / 4;
+      this.r = this.rotE;
+      this.l = 1;
+      this.portInMax = 0.24 * this.rotB * this.rotR;
+      this.portExMax = 0.18 * this.rotB * this.rotR;
+      this.floatRpm = Infinity;
+      // port timing in e-shaft deg -> normalised windows
+      const io = t.portIO;
+      const ic = 270 + t.portIC;
+      const eo = 810 - t.portEO;
+      const ec = 1080 + t.portEC;
+      this.win = {
+        inC: ((io + ic) / 2) * this.kN,
+        inD: Math.max(20, ic - io) * this.kN,
+        exC: ((eo + ec) / 2) * this.kN,
+        exD: Math.max(20, ec - eo) * this.kN,
+      };
+    } else {
+      this.B = t.bore / 1000;
+      this.r = t.stroke / 2000;
+      this.l = Math.max(t.rod / 1000, this.r * 2.2);
+      this.A = (Math.PI * this.B * this.B) / 4;
+      this.Vd = this.A * 2 * this.r;
+      this.Vc = this.Vd / (t.compression - 1);
+      const maxLift = Math.max(t.inLift, t.exLift);
+      this.floatRpm = 6800 * t.springRate * Math.sqrt(10 / maxLift) * Math.sqrt(0.088 / (2 * this.r));
+      this.win = { inC: t.inCenterline, inD: t.inDuration, exC: 720 - t.exCenterline, exD: t.exDuration };
+    }
+    // displacement per 720 of shaft, so a rotary sizes like the piston engine it breathes like
+    this.VdTotal = this.Vd * n * this.kN;
     // four valve heads, lumped into one equivalent valve each side
-    this.dIn = 0.55 * this.B;
-    this.dEx = 0.46 * this.B;
+    this.dIn = 0.5 * this.B;
+    this.dEx = 0.41 * this.B;
     const L = this.VdTotal * 1000;
-    const tbD = (40 * Math.pow(L, 0.45)) / 1000;
+    const tbD = (t.tbMm > 0 ? t.tbMm : 40 * Math.pow(L, 0.45)) / 1000;
     this.tbArea = (Math.PI * tbD * tbD) / 4;
     this.Vman = Math.max(0.0012, 1.6 * this.VdTotal);
     this.J = (0.04 + 0.05 * L) * t.flywheel;
-    const maxLift = Math.max(t.inLift, t.exLift);
-    this.floatRpm = 6800 * t.springRate * Math.sqrt(10 / maxLift) * Math.sqrt(0.088 / (2 * this.r));
     this.rodRating = t.rodStrength * 1000;
+    if (this.theta >= this.cycleLen) this.theta %= this.cycleLen;
 
     const tdcs = firingAngles(this.layout);
     if (reset || layoutChanged || this.cyls.length !== n) {
@@ -326,24 +377,31 @@ export class Engine {
   // Valve lift in mm for a cylinder at a given cycle angle
   valveLift(cycle: number, intake: boolean): number {
     const t = this.tune;
-    const center = intake ? t.inCenterline : 720 - t.exCenterline;
-    const dur = intake ? t.inDuration : t.exDuration;
-    const L = intake ? t.inLift : t.exLift;
+    const w = this.win;
+    const center = intake ? w.inC : w.exC;
+    const dur = intake ? w.inD : w.exD;
     const d = angDist720(cycle, center);
     if (d >= dur / 2) return 0;
     const u = d / (dur / 2);
-    // fast-ish ramps, flat top: raised cosine squashed a bit
     const s = 0.5 * (1 + Math.cos(Math.PI * u));
+    if (this.kind === 'rotary') {
+      // a port uncovers fast as the apex seal sweeps past, then sits wide open.
+      // reported as 0..10 so the ui has something lift shaped to show
+      return 10 * Math.min(1, s * 2.2);
+    }
+    const L = intake ? t.inLift : t.exLift;
+    // fast-ish ramps, flat top: raised cosine squashed a bit
     return L * s * (1.25 - 0.25 * s);
   }
 
   // valve events at a nominal 1 mm of lift, for the timing ring
   valveEvents() {
     const t = this.tune;
+    const w = this.win;
     const find = (intake: boolean) => {
-      const center = intake ? t.inCenterline : 720 - t.exCenterline;
-      const dur = intake ? t.inDuration : t.exDuration;
-      const L = intake ? t.inLift : t.exLift;
+      const center = intake ? w.inC : w.exC;
+      const dur = intake ? w.inD : w.exD;
+      const L = this.kind === 'rotary' ? 1e6 : intake ? t.inLift : t.exLift;
       // solve L * s(1.25 - 0.25s) = 1mm
       const k = Math.min(1, 1 / L);
       const s = (1.25 - Math.sqrt(1.5625 - k)) / 0.5;
@@ -355,6 +413,19 @@ export class Engine {
   }
 
   private geom(c: CylState) {
+    if (this.kind === 'rotary') {
+      c.cycle = wrap720((this.theta - c.tdc) * this.kN + 360);
+      const a = c.cycle * DEG;
+      // chamber volume is a pure sinusoid in rotor angle, two humps per 720 normalised
+      c.V = this.Vc + (this.Vd / 2) * (1 - Math.cos(a));
+      c.dVdth = (this.Vd / 2) * Math.sin(a) * this.kN;
+      c.x = (c.V - this.Vc) / this.A;
+      c.psi = c.cycle / this.kN;
+      c.rodAngle = 0;
+      c.vel = this.rotE * this.omega;
+      c.acc = this.rotE * this.omega * this.omega;
+      return;
+    }
     const bank = this.layout.cyls[c.idx].bank;
     const pin = this.layout.cyls[c.idx].pin;
     const psiDeg = this.theta + pin - bank;
@@ -474,6 +545,7 @@ export class Engine {
 
   rodLoad() {
     const m = this.tune.recipMass / 1000;
+    if (this.kind === 'rotary') return m * this.rotE * this.omega * this.omega;
     return m * this.r * this.omega * this.omega * (1 + this.r / this.l);
   }
 
@@ -507,7 +579,7 @@ export class Engine {
     const tunedRpm = 1.9e6 / Math.max(80, t.runner);
     const ram = 1 + 0.07 * Math.exp(-(((rpm - tunedRpm) / (0.38 * tunedRpm)) ** 2));
 
-    const pExh = PATM * (1.03 + 0.35 * (this.exhFlowF / Math.max(1e-4, (1.18 * this.VdTotal * 6000) / 120)) ** 2) + (t.boost > 0 ? t.boost * 6894.76 * this.spool * 0.7 : 0);
+    const pExh = PATM * (1.02 + 0.15 * (this.exhFlowF / Math.max(1e-4, (1.18 * this.VdTotal * 6000) / 120)) ** 2) + (t.boost > 0 ? t.boost * 6894.76 * this.spool * 0.7 : 0);
     const Texh = 700;
 
     // valve float: past the float point the valves stop seating properly
@@ -521,7 +593,8 @@ export class Engine {
     const wot = clamp((mapKpa - 72) / 25, 0, 1);
     const afrCmd = t.afrCruise + (t.afrWot - t.afrCruise) * wot;
 
-    const sp = (4 * this.r * Math.abs(omega)) / Math.PI; // mean piston speed
+    // mean piston speed, or rotor flank speed for a rotary
+    const sp = this.kind === 'rotary' ? this.rotR * Math.abs(omega) * 0.4 : (4 * this.r * Math.abs(omega)) / Math.PI;
     const wMot8 = Math.pow(Math.max(2.28 * sp, 0.5), 0.8);
     const wBurn8 = Math.pow(Math.max(2.28 * sp + 3, 0.5), 0.8);
     const bTerm = 3.26 * Math.pow(this.B, -0.2);
@@ -530,17 +603,19 @@ export class Engine {
     let mdotExhSum = 0;
     let torque = 0;
     const thetaPrev = this.theta;
-    const dTheta = (omega * h) / DEG; // deg
-    this.theta = wrap720(this.theta + dTheta);
+    const dTheta = (omega * h) / DEG; // shaft deg
+    const dThetaN = dTheta * this.kN; // normalised cycle deg
+    const L = this.cycleLen;
+    this.theta = (((this.theta + dTheta) % L) + L) % L;
 
     for (const c of this.cyls) {
       const prevCycle = c.cycle;
       this.geom(c);
       const cyc = c.cycle;
       const crossed = (mark: number) => {
-        if (dTheta <= 0) return false;
+        if (dThetaN <= 0) return false;
         const a = wrap720(mark - prevCycle);
-        return a > 0 && a <= dTheta + 1e-9;
+        return a > 0 && a <= dThetaN + 1e-9;
       };
 
       // new cycle starts at overlap TDC
@@ -575,16 +650,23 @@ export class Engine {
       c.inLift = li;
       c.exLift = le;
 
-      const curtain = (d: number, lift: number) => Math.min(Math.PI * d * (lift / 1000), 0.85 * (Math.PI * d * d) / 4);
-      const aIn = curtain(this.dIn, li);
-      const aEx = curtain(this.dEx, le);
+      // curtain area until the port itself becomes the restriction, around d/4 of lift
+      const curtain = (d: number, lift: number) => Math.min(Math.PI * d * (lift / 1000), (Math.PI * d * d) / 4);
+      const rot = this.kind === 'rotary';
+      const aIn = rot ? (this.portInMax * li) / 10 : curtain(this.dIn, li);
+      const aEx = rot ? (this.portExMax * le) / 10 : curtain(this.dEx, le);
 
       // a holed piston just blows everything into the crankcase
       const leak = c.dead && this.failure?.kind === 'piston' && this.failure.cyl === c.idx ? this.A * 0.05 : 0;
 
       const p = c.p;
       const T = c.T;
-      let mi = orifice(0.62 * aIn, this.pMan * ram, Tup, p, T);
+      // the intake charge has momentum: after BDC it keeps stuffing the cylinder
+      // for a while, more so the faster it is moving. this is what a late
+      // closing intake valve cashes in on at high rpm
+      const inertia = cyc > 180 && cyc < 320 ? 1 + Math.min(0.25, 0.0045 * (rpm / 1000) ** 2) * Math.sin(((cyc - 180) / 140) * Math.PI) : 1;
+      const pIn = this.pMan * ram * inertia;
+      let mi = orifice(0.62 * aIn, pIn, Tup, p, T);
       let me = orifice(0.66 * aEx, p, T, pExh, Texh);
       let ml = leak > 0 ? orifice(0.6 * leak, p, T, PATM, T_AMB) : 0;
 
@@ -593,7 +675,7 @@ export class Engine {
         const cap = (Math.abs(pa - p) * c.V) / (R * T) / h * 0.45;
         return clamp(md, -cap, cap);
       };
-      mi = lim(mi, this.pMan * ram);
+      mi = lim(mi, pIn);
       me = lim(me, pExh);
       ml = lim(ml, PATM);
 
@@ -613,20 +695,20 @@ export class Engine {
       mAir -= dmLk > 0 ? dmLk * airFrac : -dmLk;
 
       // intake valve closing: this is what the cylinder gets to burn
-      if (crossed(wrap720(t.inCenterline + t.inDuration / 2))) {
+      if (crossed(wrap720(this.win.inC + this.win.inD / 2))) {
         c.trappedAir = c.mAir;
         const rhoRef = PATM / (R * T_AMB);
         c.ve = c.mAir / (rhoRef * this.Vd);
       }
 
       // exhaust valve opening: blowdown pulse, the thing you hear
-      if (crossed(720 - t.exCenterline - t.exDuration / 2)) {
+      if (crossed(wrap720(this.win.exC - this.win.exD / 2))) {
         c.egt = T * 0.62;
         this.events.push({ type: 'exhaust', cyl: c.idx, t: tAt, amp: clamp((p - PATM) / 6e5, 0, 1.6) });
       }
 
       // spark
-      const totalAdv = adv - c.knockRetard;
+      const totalAdv = (adv - c.knockRetard) * this.kN;
       c.sparkAt = 360 - totalAdv;
       if (crossed(wrap720(c.sparkAt)) && this.ignition) {
         c.sparkFlash = 0.035;
@@ -639,12 +721,14 @@ export class Engine {
           if (lambda <= 1) eff = 1 - 2.2 * (lambda - 0.87) ** 2;
           else eff = (1 - 2.2 * (1 - 0.87) ** 2) / lambda;
           c.Qtot = (air / STOICH) * LHV * 0.88 * Math.max(0.2, eff);
-          const delay = 8 + (rpm / 1000) * 1.5;
+          // rotary chambers are long and thin, the flame takes longer to cross
+          const slow = this.kind === 'rotary' ? this.kN * 1.15 : 1;
+          const delay = (8 + (rpm / 1000) * 1.5) * slow;
           const lean = lambda > 1 ? (lambda - 1) * 70 : 0;
           const rich = lambda < 0.8 ? (0.8 - lambda) * 40 : 0;
           const lowLoad = 0.5 * Math.max(0, 0.6 - this.pMan / PATM);
           c.burnStart = c.sparkAt + delay;
-          c.burnDur = (50 + (rpm / 1000) * 1.5 + lean + rich) * (1 + lowLoad);
+          c.burnDur = (50 + (rpm / 1000) * 1.5 + lean + rich) * (1 + lowLoad) * slow;
           c.burning = true;
           c.xb = 0;
           c.knockInt = 0;
@@ -690,7 +774,8 @@ export class Engine {
       // Woschni-ish wall heat loss
       const w8 = c.burning ? wBurn8 : wMot8;
       const hc = bTerm * Math.exp(0.8 * Math.log(Math.max(p, 1) / 1000) - 0.55 * Math.log(T)) * w8;
-      const area = 2 * this.A + Math.PI * this.B * c.x;
+      // rotary: flank + housing strip + two side plates, a lot of wall for the volume
+      const area = this.kind === 'rotary' ? 1.5 * this.rotR * this.rotB + (2 * c.V) / this.rotB : 2 * this.A + Math.PI * this.B * c.x;
       const qLoss = 1.7 * hc * area * (T - 450) * h;
 
       const dV = c.dVdth * dTheta * DEG;
@@ -725,7 +810,8 @@ export class Engine {
     // friction, starter, absorber
     const N = Math.abs(rpm) / 1000;
     const fmep = (1.1 + 0.08 * N + 0.014 * N * N) * 1e5;
-    let tFric = (fmep * this.VdTotal) / (4 * Math.PI);
+    // no valvetrain on a rotary, so a bit less to drag around
+    let tFric = ((this.kind === 'rotary' ? 0.8 : 1) * fmep * this.VdTotal) / (4 * Math.PI);
     tFric *= Math.tanh(omega / 3);
     if (this.failure?.kind === 'rod') tFric += 400 * Math.tanh(omega / 2);
 

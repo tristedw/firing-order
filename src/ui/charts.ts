@@ -200,10 +200,11 @@ export function drawTimingRing(c: HTMLCanvasElement, e: Engine) {
 
   g.fillStyle = p.ink;
   g.font = `600 ${Math.round(R * 0.3)}px ${FONT}`;
-  g.fillText(String(e.watch + 1), cx, cy - R * 0.08);
+  g.fillText(e.layout.labels[e.watch] ?? String(e.watch + 1), cx, cy - R * 0.08);
   g.fillStyle = p.ink2;
   g.font = `400 11px ${FONT}`;
-  g.fillText(`${Math.round(cyl.cycle)}°`, cx, cy + R * 0.18);
+  // rotary shows real e-shaft degrees, the ring itself stays one lap per cycle
+  g.fillText(`${Math.round(cyl.cycle / e.kN)}°`, cx, cy + R * 0.18);
 }
 
 // ---------------------------------------------------------------- P-V and P-theta
