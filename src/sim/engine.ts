@@ -875,7 +875,12 @@ export class Engine {
         // raw mixture hits a header still hot from the other cylinders and goes off in the pipe
         if (c.unburnt) {
           c.unburnt = false;
-          if (Math.max(...this.cyls.map((k) => k.egt)) > 650 && Math.random() < 0.3) {
+          // a lot more likely with a big overlap cam (or a bridgeport), where the pipe gets
+          // fresh charge and heat at the same time. a stock motor barely ever does it
+          const w = this.win;
+          const ovl = Math.max(0, w.exC + w.exD / 2 - 720 - (w.inC - w.inD / 2));
+          const chance = (this.kind === 'rotary' ? 0.12 : 0.02) + 0.3 * clamp((ovl - 30) / 45, 0, 1);
+          if (Math.max(...this.cyls.map((k) => k.egt)) > 650 && Math.random() < chance) {
             const amp = 0.4 + Math.random() * 0.6;
             this.events.push({ type: 'pop', cyl: c.idx, t: tAt + 0.002, amp });
             this.stepTrig = c.idx + 100;

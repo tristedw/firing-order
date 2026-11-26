@@ -33,7 +33,7 @@ Each cylinder is a single zone of gas tracked by mass, temperature and how much 
 - **Turbo**: toggle it on any engine. Wastegate pressure, compressor size, intercooler and blow off valve. The wheel spools off exhaust flow and heat, so a big turbo lags and a small one chokes up top, heats the charge, backs up the exhaust and can overspeed until the wheel lets go. Lift without a BOV and the compressor surges.
 - **Cylinder pressure limit**: peak pressure past what the head gasket (or rotary seals) holds wears it down cycle by cycle until it blows.
 - **Dilution and misfires**: exhaust pushed back up the intake during overlap comes back in with the next charge. A diluted charge burns slow and uneven and some cycles never light, which is where a big cam's lope and a bridgeport's brap come from. Unlit mixture can pop in the header.
-- **Sound**: piston engines play real recordings from freesound (CC0 and CC BY, credits in `public/audio/banks/CREDITS.md`). Each recording is pitch tracked offline and cut into grains tagged with rpm and throttle. At runtime every grain picks the closest match to the sim and gets resampled to the exact rpm, and each exhaust opening from the sim scales the level, so misfires and a lumpy cam still come through. Backfires and the BOV are recorded one shots. There are no free rotary recordings, so rotaries use the sim's header flow turned into flow noise and convolved with a recorded exhaust, the way AngeTheGreat's [engine-sim](https://github.com/ange-yaghi/engine-sim) does it (impulse responses in `public/audio`, MIT). Turbo whine, compressor surge and knock ping sit on top.
+- **Sound**: all of it comes out of the sim. Every step the sim hands over the wave each bank's exhaust valves (or rotary ports) push into the pipes, the intake runner wave, and every backfire. The audio thread runs that through waveguide headers, a collector, the pipe, a muffler with an expansion chamber and the tailpipe, then radiation off the tip plus gas hiss that follows the flow. Pipe lengths come from the engine (cylinder size, runner length, cam overlap, turbo). The pipe model follows Baldan et al., *Physically informed car engine sound synthesis* (2015), the input conditioning follows AngeTheGreat's [engine-sim](https://github.com/ange-yaghi/engine-sim), and the overall spectrum was checked against free recordings of similar engines. Backfires go off inside the pipe so they come out through the muffler like real ones, and they're mostly a big cam and rotary thing. The stream is read with a stretchy read head and ends in a soft saturator, so nothing clicks or clips. Turbo whine and air, BOV, compressor surge, knock ping (tuned to the bore) and the starter sit on top.
 - **Misfire and knock counters**: totals and a per minute rate, per cylinder too. Click either readout to reset.
 - **Units**: imperial or metric everywhere, tune fields, inspector, charts and readouts.
 - **Pushrod or overhead cam**: the small blocks and the big twin run one cam in the block with lifters, pushrods and rockers. Lobe lift times rocker ratio is valve lift (LS heads are 1.7, an SBC 1.5), and the extra valvetrain weight makes the valves float a little sooner than an OHC with the same springs. Any piston engine can be switched in the Camshaft tab.
@@ -46,7 +46,7 @@ Each rotor flank is treated as its own chamber running a four stroke cycle over 
 
 It is tuned to land in the right ballpark (a stock-ish 350 makes around 340 lb-ft and 330 hp) rather than to match any real engine. MBT spark falls out of the model instead of being hard coded, which makes the spark table actually worth playing with.
 
-Sound follows the sim live. Recorded grains are picked and pitched by rpm and throttle every few milliseconds, and every exhaust valve opening scales them by that cylinder's blowdown, so misfires and the limiter come out of the sim.
+Sound is generated live from the sim's own valve flow, so firing order, a lumpy cam, misfires, backfires and the limiter all come out of the physics.
 
 ## Keys
 
@@ -78,7 +78,7 @@ TypeScript, three.js, Vite, Web Audio. No framework, the UI is plain DOM.
 src/
   sim/       engine model, layouts and firing angles, tunes and presets
   render/    three.js scene, procedural engine geometry
-  audio/     recorded grain engine sound, rotary flow synth, knock and turbo
+  audio/     waveguide exhaust and intake sound driven by the sim, turbo, knock
   ui/        tune panel, spark table, gauges and charts
 ```
 
