@@ -216,7 +216,7 @@ function phaseColor(p: Palette, deg: number) {
   return p.exhaust;
 }
 
-export function drawPV(c: HTMLCanvasElement, tr: Trace, e: Engine, logScale: boolean) {
+export function drawPV(c: HTMLCanvasElement, tr: Trace, e: Engine, logScale: boolean, imperial = false) {
   const { g, w, h } = fit(c);
   const p = pal();
   g.clearRect(0, 0, w, h);
@@ -244,7 +244,8 @@ export function drawPV(c: HTMLCanvasElement, tr: Trace, e: Engine, logScale: boo
   g.font = `400 10px ${FONT}`;
   g.textAlign = 'right';
   g.textBaseline = 'middle';
-  const ticks = logScale ? [0.5, 1, 2, 5, 10, 20, 50, 100].map((b) => b * 1e5) : niceTicks(0, pMax, 4);
+  const sc = imperial ? 6894.76 : 1e5;
+  const ticks = logScale ? (imperial ? [10, 20, 50, 100, 200, 500, 1000, 1500] : [0.5, 1, 2, 5, 10, 20, 50, 100]).map((b) => b * sc).filter((t) => t >= pMin && t <= pMax) : niceTicks(0, pMax / sc, 4).map((t) => t * sc);
   for (const t of ticks) {
     if (t > pMax || t < pMin) continue;
     const y = Y(t);
@@ -254,7 +255,7 @@ export function drawPV(c: HTMLCanvasElement, tr: Trace, e: Engine, logScale: boo
     g.moveTo(padL, y);
     g.lineTo(w - padR, y);
     g.stroke();
-    g.fillText(`${+(t / 1e5).toFixed(1)}`, padL - 6, y);
+    g.fillText(`${+(t / sc).toFixed(imperial ? 0 : 1)}`, padL - 6, y);
   }
   g.textAlign = 'center';
   g.textBaseline = 'top';
@@ -273,7 +274,7 @@ export function drawPV(c: HTMLCanvasElement, tr: Trace, e: Engine, logScale: boo
   }
 }
 
-export function drawPTheta(c: HTMLCanvasElement, tr: Trace, e: Engine) {
+export function drawPTheta(c: HTMLCanvasElement, tr: Trace, e: Engine, imperial = false) {
   const { g, w, h } = fit(c);
   const p = pal();
   g.clearRect(0, 0, w, h);
@@ -292,7 +293,8 @@ export function drawPTheta(c: HTMLCanvasElement, tr: Trace, e: Engine) {
   g.fillStyle = p.ink2;
   g.textAlign = 'right';
   g.textBaseline = 'middle';
-  for (const t of niceTicks(0, pMax, 4)) {
+  const sc = imperial ? 6894.76 : 1e5;
+  for (const t of niceTicks(0, pMax / sc, 4).map((v) => v * sc)) {
     const y = Y(t);
     g.strokeStyle = p.line;
     g.lineWidth = 1;
@@ -300,7 +302,7 @@ export function drawPTheta(c: HTMLCanvasElement, tr: Trace, e: Engine) {
     g.moveTo(padL, y);
     g.lineTo(w - padR, y);
     g.stroke();
-    g.fillText(`${+(t / 1e5).toFixed(0)}`, padL - 6, y);
+    g.fillText(`${+(t / sc).toFixed(0)}`, padL - 6, y);
   }
   g.textAlign = 'center';
   g.textBaseline = 'top';

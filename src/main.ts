@@ -56,6 +56,23 @@ const U = {
   temp: (k: number) => (imperial ? [((k - 273.15) * 9) / 5 + 32, '°F'] : [k - 273.15, '°C']) as [number, string],
   boost: (pa: number) => (imperial ? [pa / 6894.76, 'psi'] : [pa / 1000, 'kPa']) as [number, string],
   speed: (ms: number) => (imperial ? [ms * 196.85, 'ft/min'] : [ms, 'm/s']) as [number, string],
+  press: (pa: number) => (imperial ? [pa / 6894.76, 'psi'] : [pa / 1e5, 'bar']) as [number, string],
+  len: (mm: number) => (imperial ? [mm / 25.4, 'in'] : [mm, 'mm']) as [number, string],
+  force: (n: number) => (imperial ? [n * 0.224809, 'lbf'] : [n / 1000, 'kN']) as [number, string],
+  flow: (kgs: number) => (imperial ? [kgs * 132.28, 'lb/min'] : [kgs * 60, 'kg/min']) as [number, string],
+};
+// formatted with the right precision for each unit
+const P = (pa: number) => {
+  const [v, u] = U.press(pa);
+  return `${fmt(v, imperial ? 0 : 1)} ${u}`;
+};
+const Lm = (mm: number) => {
+  const [v, u] = U.len(mm);
+  return imperial ? `${fmt(v, 3)} ${u}` : `${fmt(v, 2)} ${u}`;
+};
+const F = (n: number) => {
+  const [v, u] = U.force(n);
+  return imperial ? `${fmt(v)} ${u}` : `${fmt(v, 1)} ${u}`;
 };
 const fmt = (v: number, d = 0) => v.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 
@@ -114,6 +131,7 @@ function rebuildView() {
 }
 
 const panel = new TunePanel($('tune'), () => tune, {
+  imperial: () => imperial,
   onChange(key) {
     if (presetSel.value !== 'custom') {
       presetSel.value = 'custom';
@@ -168,6 +186,7 @@ function start() {
   sound.resume();
   if (engine.failure) return toast('Rebuild the engine first.');
   engine.ignition = true;
+  engine.resetCounts();
   starting = true;
   startTimer = 0;
 }
@@ -219,10 +238,25 @@ function segGroup(attr: string, onPick: (v: string) => void) {
 const setSpeed = segGroup('speed', (v) => (timeScale = +v));
 const setBlock = segGroup('block', (v) => view.setBlockMode(v as 'ghost' | 'solid' | 'hidden'));
 segGroup('view', (v) => view.frame(v as 'iso'));
-segGroup('units', (v) => {
+const setUnits = segGroup('units', (v) => {
   imperial = v === 'imperial';
+  try {
+    localStorage.setItem('firing-order:units', v);
+  } catch {}
+  panel.sync();
   drawDynoNow();
+  updateReadouts();
+  if (inspected) fillInspector();
+  drawCharts();
 });
+{
+  let u = 'imperial';
+  try {
+    u = localStorage.getItem('firing-order:units') ?? 'imperial';
+  } catch {}
+  imperial = u === 'imperial';
+  setUnits(u);
+}
 document.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((b) => b.setAttribute('aria-pressed', 'false'));
 
 const soundBtn = $<HTMLButtonElement>('sound');
@@ -329,7 +363,7 @@ engine.onDynoDone = (bins) => {
 // ---------------------------------------------------------------- cylinders
 
 const cylHost = $('cyls');
-let cylEls: { root: HTMLElement; lamp: HTMLElement; dmg: HTMLElement; cut: HTMLButtonElement }[] = [];
+let cylEls: { root: HTMLElement; lamp: HTMLElement; dmg: HTMLElement; cut: HTMLButtonElement; counts: HTMLElement }[] = [];
 
 function buildCylinders() {
   cylHost.innerHTML = '';
@@ -364,9 +398,11 @@ function buildCylinders() {
       else engine.killed.add(c.idx);
       cut.setAttribute('aria-pressed', String(engine.killed.has(c.idx)));
     };
-    root.append(pick, dmgWrap, cut);
+    const counts = document.createElement('div');
+    counts.className = 'counts';
+    root.append(pick, dmgWrap, counts, cut);
     cylHost.append(root);
-    return { root, lamp, dmg, cut };
+    return { root, lamp, dmg, cut, counts };
   });
   cylHost.style.gridTemplateColumns = `repeat(${engine.kind === 'rotary' ? 3 : Math.min(4, engine.cyls.length)}, 1fr)`;
   $('cyl-title').textContent = engine.kind === 'rotary' ? 'Chambers' : 'Cylinders';
@@ -444,14 +480,14 @@ function fillRotary(hit: PartHit) {
   const rows: [string, string][] = [];
   const t = tune;
   const k = engine.kN;
-  const faceRows = () => faces.forEach((c) => rows.push([`Chamber ${lay.labels[c.idx]}`, `${strokeName(c.cycle)}, ${fmt(c.p / 1e5, 1)} bar`]));
+  const faceRows = () => faces.forEach((c) => rows.push([`Chamber ${lay.labels[c.idx]}`, `${strokeName(c.cycle)}, ${P(c.p)}`]));
   switch (hit.kind) {
     case 'rotor': {
       rows.push(['Rotor angle', `${fmt(((engine.theta + lay.rotors![rotorIdx].phase) / 3) % 360)}°`]);
       faceRows();
-      rows.push(['Bearing load', `${fmt(engine.rodLoad() / 1000, 1)} kN`]);
-      rows.push(['Rated to', `${fmt(engine.rodRating / 1000, 1)} kN`]);
-      rows.push(['Apex speed', `${fmt((engine.rotR + engine.rotE) * (Math.abs(engine.omega) / 3), 1)} m/s`]);
+      rows.push(['Bearing load', F(engine.rodLoad())]);
+      rows.push(['Rated to', F(engine.rodRating)]);
+      rows.push(['Apex speed', `${fmt(U.speed((engine.rotR + engine.rotE) * (Math.abs(engine.omega) / 3))[0], imperial ? 0 : 1)} ${U.speed(0)[1]}`]);
       break;
     }
     case 'crank': {
@@ -481,8 +517,8 @@ function fillRotary(hit: PartHit) {
       rows.push(['Advance', `${fmt((360 - next.sparkAt) / k, 1)}° BTDC`]);
       rows.push(['Knock retard', `${fmt(next.knockRetard, 1)}°`]);
       rows.push(['50% burned at', `${fmt(next.ca50Last / k, 1)}° ATDC`]);
-      rows.push(['Peak pressure', `${fmt(next.peakPLast / 1e5)} bar`]);
-      rows.push(['IMEP', `${fmt(next.imep / 1e5, 1)} bar`]);
+      rows.push(['Peak pressure', P(next.peakPLast)]);
+      rows.push(['IMEP', P(next.imep)]);
       break;
     }
     case 'flywheel':
@@ -513,18 +549,18 @@ function fillInspector() {
   switch (hit.kind) {
     case 'piston': {
       const [sv, su] = U.speed(Math.abs(c!.vel));
-      rows.push(['Down from TDC', `${fmt(c!.x * 1000, 1)} mm`]);
+      rows.push(['Down from TDC', Lm(c!.x * 1000)]);
       rows.push(['Speed', `${fmt(sv, imperial ? 0 : 1)} ${su}`]);
       rows.push(['Acceleration', `${fmt(c!.acc / 9.81)} g`]);
-      rows.push(['Gas force', `${fmt(((c!.p - PATM) * engine.A) / 1000, 1)} kN`]);
-      rows.push(['Pressure', `${fmt(c!.p / 1e5, 1)} bar`]);
+      rows.push(['Gas force', F((c!.p - PATM) * engine.A)]);
+      rows.push(['Pressure', P(c!.p)]);
       break;
     }
     case 'rod': {
       const ld = engine.rodLoad();
       rows.push(['Angle', `${fmt(c!.rodAngle / DEG, 1)}°`]);
-      rows.push(['Inertia load', `${fmt(ld / 1000, 1)} kN`]);
-      rows.push(['Rated to', `${fmt(engine.rodRating / 1000, 1)} kN`]);
+      rows.push(['Inertia load', F(ld)]);
+      rows.push(['Rated to', F(engine.rodRating)]);
       rows.push(['Lets go near', `${fmt(Math.round(rodLimitRpm() / 10) * 10)} rpm`]);
       rows.push(['Rod to stroke', fmt(t.rod / t.stroke, 2)]);
       break;
@@ -546,35 +582,35 @@ function fillInspector() {
       rows.push(['Shaft speed', tr.dead ? 'Wheel is gone' : `${fmt(Math.round(tr.shaftRpm / 1000))}k rpm`]);
       rows.push(['Boost before throttle', `${fmt(bp, 1)} ${bu}`]);
       rows.push(['Pressure ratio', `${fmt(tr.pr, 2)}`]);
-      rows.push(['Flow', `${fmt(tr.flow * 132.3, 1)} lb/min, ${fmt(tr.flowFrac * 100)}% of choke`]);
+      rows.push(['Flow', `${fmt(U.flow(tr.flow)[0], 1)} ${U.flow(0)[1]}, ${fmt(tr.flowFrac * 100)}% of choke`]);
       rows.push(['Compressor efficiency', `${fmt(tr.eff * 100)}%`]);
       rows.push(['Off the compressor', `${fmt(U.temp(tr.compOutT)[0])} ${U.temp(tr.compOutT)[1]}`]);
       rows.push(['Into the engine', `${fmt(U.temp(tr.chargeT)[0])} ${U.temp(tr.chargeT)[1]}`]);
       rows.push(['Exhaust back pressure', `${fmt(ep, 1)} ${eu}`]);
-      rows.push(['Peak cylinder pressure', `${fmt(r.peakBar)} of ${fmt(r.pressureLimit)} bar`]);
+      rows.push(['Peak cylinder pressure', `${P(r.peakBar * 1e5)} of ${P(r.pressureLimit * 1e5)}`]);
       if (tr.surging) rows.push(['Compressor', 'Surging']);
       break;
     }
     case 'pushrod': {
       const rr = Math.max(1, t.rockerRatio);
-      rows.push(['Intake lifter', `${fmt(c!.inLift / rr, 2)} mm`]);
-      rows.push(['Exhaust lifter', `${fmt(c!.exLift / rr, 2)} mm`]);
+      rows.push(['Intake lifter', Lm(c!.inLift / rr)]);
+      rows.push(['Exhaust lifter', Lm(c!.exLift / rr)]);
       rows.push(['Rocker ratio', `${fmt(rr, 2)}:1`]);
-      rows.push(['Intake valve', `${fmt(c!.inLift, 2)} mm`]);
-      rows.push(['Exhaust valve', `${fmt(c!.exLift, 2)} mm`]);
+      rows.push(['Intake valve', Lm(c!.inLift)]);
+      rows.push(['Exhaust valve', Lm(c!.exLift)]);
       rows.push(['Floats above', `${fmt(Math.round(engine.floatRpm / 10) * 10)} rpm`]);
       break;
     }
     case 'intake-valve':
-      rows.push(['Lift', `${fmt(c!.inLift, 2)} mm`]);
-      if (pushrodHead) rows.push(['Lobe lift', `${fmt(t.inLift / Math.max(1, t.rockerRatio), 2)} mm at ${fmt(t.rockerRatio, 2)}:1`]);
+      rows.push(['Lift', Lm(c!.inLift)]);
+      if (pushrodHead) rows.push(['Lobe lift', `${Lm(t.inLift / Math.max(1, t.rockerRatio))} at ${fmt(t.rockerRatio, 2)}:1`]);
       rows.push(['Opens', `${fmt(720 - ev.intake.open)}° BTDC`]);
       rows.push(['Closes', `${fmt(ev.intake.close - 180)}° ABDC`]);
       rows.push(['Floats above', `${fmt(Math.round(engine.floatRpm / 10) * 10)} rpm`]);
       break;
     case 'exhaust-valve':
-      rows.push(['Lift', `${fmt(c!.exLift, 2)} mm`]);
-      if (pushrodHead) rows.push(['Lobe lift', `${fmt(t.exLift / Math.max(1, t.rockerRatio), 2)} mm at ${fmt(t.rockerRatio, 2)}:1`]);
+      rows.push(['Lift', Lm(c!.exLift)]);
+      if (pushrodHead) rows.push(['Lobe lift', `${Lm(t.exLift / Math.max(1, t.rockerRatio))} at ${fmt(t.rockerRatio, 2)}:1`]);
       rows.push(['Opens', `${fmt(540 - ev.exhaust.open)}° BBDC`]);
       rows.push(['Closes', `${fmt(ev.exhaust.close)}° ATDC`]);
       rows.push(['EGT at opening', `${fmt(U.temp(c!.egt)[0])} ${U.temp(c!.egt)[1]}`]);
@@ -595,8 +631,8 @@ function fillInspector() {
       rows.push(['Advance', `${fmt(360 - c!.sparkAt, 1)}° BTDC`]);
       rows.push(['Knock retard', `${fmt(c!.knockRetard, 1)}°`]);
       rows.push(['50% burned at', `${fmt(c!.ca50Last, 1)}° ATDC`]);
-      rows.push(['Peak pressure', `${fmt(c!.peakPLast / 1e5)} bar`]);
-      rows.push(['IMEP', `${fmt(c!.imep / 1e5, 1)} bar`]);
+      rows.push(['Peak pressure', P(c!.peakPLast)]);
+      rows.push(['IMEP', P(c!.imep)]);
       break;
   }
   const dl = $('insp-data');
@@ -704,7 +740,7 @@ window.addEventListener('blur', () => (wHeld = false));
 // ---------------------------------------------------------------- readouts
 
 const readHost = $('readouts');
-const READ_KEYS = ['torque', 'power', 'map', 'afr', 'spark', 've', 'egt', 'rod'] as const;
+const READ_KEYS = ['torque', 'power', 'map', 'afr', 'spark', 've', 'egt', 'rod', 'miss', 'knock'] as const;
 const readEls: Record<string, HTMLElement> = {};
 const READ_LABELS: Record<string, string> = {
   torque: 'Torque',
@@ -715,6 +751,8 @@ const READ_LABELS: Record<string, string> = {
   ve: 'Vol. efficiency',
   egt: 'EGT',
   rod: 'Rod load',
+  miss: 'Misfires',
+  knock: 'Knock',
 };
 for (const k of READ_KEYS) {
   const d = document.createElement('div');
@@ -724,6 +762,28 @@ for (const k of READ_KEYS) {
   d.append(dt, dd);
   readHost.append(d);
   readEls[k] = dd;
+  if (k === 'miss' || k === 'knock') {
+    d.className = 'resettable';
+    d.tabIndex = 0;
+    d.setAttribute('role', 'button');
+    d.title = 'Click to reset the counts';
+    const reset = () => {
+      engine.resetCounts();
+      updateReadouts();
+    };
+    d.onclick = reset;
+    d.onkeydown = (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        reset();
+      }
+    };
+  }
+}
+
+function drawCharts() {
+  drawPV($<HTMLCanvasElement>('pv'), engine.traceDone, engine, pvLog, imperial);
+  drawPTheta($<HTMLCanvasElement>('pt'), engine.traceDone, engine, imperial);
 }
 
 function updateReadouts() {
@@ -748,6 +808,14 @@ function updateReadouts() {
   readEls.rod.innerHTML = `${fmt(rodPct)}<small>% of rating</small>`;
   (readEls.rod.previousElementSibling as HTMLElement).textContent = engine.kind === 'rotary' ? 'Rotor load' : 'Rod load';
   readEls.rod.dataset.warn = String(rodPct > 85);
+  const miss = engine.cyls.reduce((a, c) => a + c.misfires, 0);
+  const knocks = engine.cyls.reduce((a, c) => a + c.knocks, 0);
+  const missRate = engine.rate(engine.missLog);
+  const knockRate = engine.rate(engine.knockLog);
+  readEls.miss.innerHTML = `${fmt(miss)}<small>${fmt(missRate)} a min</small>`;
+  readEls.miss.dataset.warn = String(missRate > 30);
+  readEls.knock.innerHTML = `${fmt(knocks)}<small>${fmt(knockRate)} a min</small>`;
+  readEls.knock.dataset.warn = String(knockRate > 0);
 
   // status
   let st = 'Off';
@@ -775,10 +843,12 @@ function updateReadouts() {
     el.lamp.dataset.on = c.knockFlash > 0 ? 'knock' : c.sparkFlash > 0 || (c.burning && c.xb < 0.6) ? 'spark' : '';
     el.dmg.style.width = `${Math.min(100, c.damage * 100)}%`;
     el.root.dataset.dead = String(c.dead);
+    const txt = `${c.misfires ? `<b class="m" title="Misfires">${c.misfires}</b>` : ''}${c.knocks ? `<b class="k" title="Knock">${c.knocks}</b>` : ''}`;
+    if (el.counts.innerHTML !== txt) el.counts.innerHTML = txt;
   });
 
   const c = engine.cyls[engine.watch];
-  if (c) $('pt-note').textContent = `${engine.kind === 'rotary' ? 'Chamber' : 'Cylinder'} ${engine.layout.labels[engine.watch]}, peak ${fmt(c.peakPLast / 1e5)} bar, IMEP ${fmt(c.imep / 1e5, 1)} bar`;
+  if (c) $('pt-note').textContent = `${engine.kind === 'rotary' ? 'Chamber' : 'Cylinder'} ${engine.layout.labels[engine.watch]}, peak ${P(c.peakPLast)}, IMEP ${P(c.imep)}`;
 
   panel.updateDerived({ floatRpm: engine.floatRpm, rodRpm: rodLimitRpm() });
   panel.tick();
@@ -866,8 +936,7 @@ function frame(now: number) {
   chartTick += dtReal;
   if (chartTick > 0.1) {
     chartTick = 0;
-    drawPV($<HTMLCanvasElement>('pv'), engine.traceDone, engine, pvLog);
-    drawPTheta($<HTMLCanvasElement>('pt'), engine.traceDone, engine);
+    drawCharts();
     if (engine.dynoActive) drawDynoNow();
   }
   requestAnimationFrame(frame);

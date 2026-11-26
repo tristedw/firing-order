@@ -12,21 +12,31 @@ interface Field {
   step: number;
   hint?: string;
   only?: 'piston' | 'rotary' | 'pushrod' | 'turbo';
+  conv?: Conv;
 }
 
-export const GEOMETRY_KEYS = new Set<keyof Tune>(['turbo', 'turboSize', 'valvetrain', 'rockerRatio', 'layout', 'bore', 'stroke', 'rod', 'compression', 'inDuration', 'exDuration', 'inLift', 'exLift', 'rotorR', 'rotorE', 'rotorB']);
+// stored value is always metric (boost in psi, like the gauge). conv says how to show it the other way
+type Conv = 'len' | 'boost' | 'press' | 'force';
+const CONV: Record<Conv, { imp: [number, string, number]; met: [number, string, number] }> = {
+  len: { met: [1, 'mm', 2], imp: [1 / 25.4, 'in', 3] },
+  boost: { met: [6.89476, 'kPa', 0], imp: [1, 'psi', 1] },
+  press: { met: [1, 'bar', 0], imp: [14.5038, 'psi', 0] },
+  force: { met: [1, 'kN', 1], imp: [224.809, 'lbf', 0] },
+};
+
+export const GEOMETRY_KEYS = new Set<keyof Tune>(['turbo', 'turboSize', 'intercooler', 'bov', 'valvetrain', 'rockerRatio', 'layout', 'bore', 'stroke', 'rod', 'compression', 'inDuration', 'exDuration', 'inLift', 'exLift', 'rotorR', 'rotorE', 'rotorB']);
 
 const GROUPS: { id: string; name: string; fields: Field[] }[] = [
   {
     id: 'engine',
     name: 'Bottom end',
     fields: [
-      { key: 'bore', label: 'Bore', unit: 'mm', min: 50, max: 115, step: 0.1, only: 'piston' },
-      { key: 'stroke', label: 'Stroke', unit: 'mm', min: 40, max: 120, step: 0.1, only: 'piston' },
-      { key: 'rod', label: 'Rod length', unit: 'mm', min: 80, max: 200, step: 0.5, only: 'piston', hint: 'Center to center. Longer rods mean less side load and a gentler piston dwell at TDC.' },
-      { key: 'rotorR', label: 'Generating radius', unit: 'mm', min: 70, max: 130, step: 0.5, only: 'rotary', hint: 'Rotor center to apex. Sets the size of the housing.' },
-      { key: 'rotorE', label: 'Eccentricity', unit: 'mm', min: 10, max: 22, step: 0.1, only: 'rotary', hint: 'Offset of the e-shaft lobe. Chamber volume scales with it directly.' },
-      { key: 'rotorB', label: 'Rotor width', unit: 'mm', min: 50, max: 110, step: 0.5, only: 'rotary' },
+      { key: 'bore', label: 'Bore', unit: 'mm', min: 50, max: 115, step: 0.1, only: 'piston' , conv: 'len' },
+      { key: 'stroke', label: 'Stroke', unit: 'mm', min: 40, max: 120, step: 0.1, only: 'piston' , conv: 'len' },
+      { key: 'rod', label: 'Rod length', unit: 'mm', min: 80, max: 200, step: 0.5, only: 'piston', hint: 'Center to center. Longer rods mean less side load and a gentler piston dwell at TDC.' , conv: 'len' },
+      { key: 'rotorR', label: 'Generating radius', unit: 'mm', min: 70, max: 130, step: 0.5, only: 'rotary', hint: 'Rotor center to apex. Sets the size of the housing.' , conv: 'len' },
+      { key: 'rotorE', label: 'Eccentricity', unit: 'mm', min: 10, max: 22, step: 0.1, only: 'rotary', hint: 'Offset of the e-shaft lobe. Chamber volume scales with it directly.' , conv: 'len' },
+      { key: 'rotorB', label: 'Rotor width', unit: 'mm', min: 50, max: 110, step: 0.5, only: 'rotary' , conv: 'len' },
       { key: 'compression', label: 'Compression', unit: ':1', min: 6, max: 15, step: 0.1 },
       { key: 'recipMass', label: 'Piston and pin mass', unit: 'g', min: 120, max: 1000, step: 5, only: 'piston', hint: 'Sets rod load. Heavy parts break rods at lower rpm.' },
       { key: 'recipMass', label: 'Rotor mass', unit: 'g', min: 2000, max: 8000, step: 50, only: 'rotary', hint: 'The rotor orbits on the e-shaft lobe, so its weight loads the bearing every revolution.' },
@@ -41,8 +51,8 @@ const GROUPS: { id: string; name: string; fields: Field[] }[] = [
       { key: 'exDuration', label: 'Exhaust duration', unit: '°', min: 180, max: 320, step: 1, only: 'piston' },
       { key: 'inCenterline', label: 'Intake centerline', unit: '° ATDC', min: 90, max: 130, step: 0.5, only: 'piston', hint: 'Lower numbers advance the cam: torque moves down the rev range.' },
       { key: 'exCenterline', label: 'Exhaust centerline', unit: '° BTDC', min: 90, max: 130, step: 0.5, only: 'piston' },
-      { key: 'inLift', label: 'Intake lift', unit: 'mm', min: 4, max: 17, step: 0.1, only: 'piston' },
-      { key: 'exLift', label: 'Exhaust lift', unit: 'mm', min: 4, max: 17, step: 0.1, only: 'piston' },
+      { key: 'inLift', label: 'Intake lift', unit: 'mm', min: 4, max: 17, step: 0.1, only: 'piston' , conv: 'len' },
+      { key: 'exLift', label: 'Exhaust lift', unit: 'mm', min: 4, max: 17, step: 0.1, only: 'piston' , conv: 'len' },
       { key: 'rockerRatio', label: 'Rocker ratio', unit: ':1', min: 1.3, max: 2, step: 0.05, only: 'pushrod', hint: 'Valve lift is lobe lift times this. LS heads run 1.7, a small block Chevy 1.5.' },
       { key: 'springRate', label: 'Valve springs', unit: '×', min: 0.6, max: 2, step: 0.05, only: 'piston', hint: 'Stiffer springs push valve float higher. Pushrod valvetrains carry more weight and float a bit sooner.' },
       { key: 'portIO', label: 'Intake opens', unit: '° ATDC', min: -80, max: 60, step: 1, only: 'rotary', hint: 'E-shaft degrees. Porting a rotary is the same game as picking a cam: open earlier and close later for top end.' },
@@ -58,9 +68,9 @@ const GROUPS: { id: string; name: string; fields: Field[] }[] = [
       { key: 'afrCruise', label: 'AFR at part throttle', unit: ':1', min: 10, max: 18, step: 0.1 },
       { key: 'afrWot', label: 'AFR at full throttle', unit: ':1', min: 10, max: 18, step: 0.1, hint: 'Best power is a bit rich, around 12.5 to 13.' },
       { key: 'octane', label: 'Fuel octane', unit: 'AKI', min: 80, max: 110, step: 1 },
-      { key: 'runner', label: 'Intake runner', unit: 'mm', min: 100, max: 600, step: 5 },
+      { key: 'runner', label: 'Intake runner', unit: 'mm', min: 100, max: 600, step: 5 , conv: 'len' },
       { key: 'tbMm', label: 'Throttle body', unit: 'mm', min: 0, max: 120, step: 1, hint: '0 sizes it from displacement.' },
-      { key: 'boost', label: 'Wastegate', unit: 'psi', min: 2, max: 35, step: 0.5, only: 'turbo', hint: 'Boost the gate holds once the turbo is lit. More boost means more heat in the charge and more pressure in the cylinder.' },
+      { key: 'boost', label: 'Wastegate', unit: 'psi', min: 2, max: 35, step: 0.5, only: 'turbo', hint: 'Boost the gate holds once the turbo is lit. More boost means more heat in the charge and more pressure in the cylinder.' , conv: 'boost' },
       { key: 'turboSize', label: 'Compressor inducer', unit: 'mm', min: 38, max: 90, step: 1, only: 'turbo', hint: 'Bigger flows more air up top but needs more exhaust to wake up. Too small and it chokes and oversped.' },
     ],
   },
@@ -70,10 +80,10 @@ const GROUPS: { id: string; name: string; fields: Field[] }[] = [
     fields: [
       { key: 'revLimit', label: 'Rev limiter', unit: 'rpm', min: 2000, max: 12000, step: 50 },
       { key: 'idleRpm', label: 'Idle target', unit: 'rpm', min: 500, max: 2000, step: 10 },
-      { key: 'rodStrength', label: 'Rod strength', unit: 'kN', min: 4, max: 60, step: 0.5, only: 'piston', hint: 'How much inertial pull the rods take before one snaps. Forged rods buy you rpm.' },
-      { key: 'pressureLimit', label: 'Head gasket holds', unit: 'bar', min: 50, max: 160, step: 1, only: 'piston', hint: 'Peak cylinder pressure before the gasket starts to give. MLS gaskets and head studs move this up.' },
-      { key: 'pressureLimit', label: 'Seals hold', unit: 'bar', min: 50, max: 140, step: 1, only: 'rotary', hint: 'Peak chamber pressure the side and corner seals take before they start blowing by.' },
-      { key: 'rodStrength', label: 'Rotor bearing rating', unit: 'kN', min: 20, max: 160, step: 1, only: 'rotary', hint: 'Load the rotor bearing takes from the rotor orbiting the e-shaft.' },
+      { key: 'rodStrength', label: 'Rod strength', unit: 'kN', min: 4, max: 60, step: 0.5, only: 'piston', hint: 'How much inertial pull the rods take before one snaps. Forged rods buy you rpm.' , conv: 'force' },
+      { key: 'pressureLimit', label: 'Head gasket holds', unit: 'bar', min: 50, max: 160, step: 1, only: 'piston', hint: 'Peak cylinder pressure before the gasket starts to give. MLS gaskets and head studs move this up.' , conv: 'press' },
+      { key: 'pressureLimit', label: 'Seals hold', unit: 'bar', min: 50, max: 140, step: 1, only: 'rotary', hint: 'Peak chamber pressure the side and corner seals take before they start blowing by.' , conv: 'press' },
+      { key: 'rodStrength', label: 'Rotor bearing rating', unit: 'kN', min: 20, max: 160, step: 1, only: 'rotary', hint: 'Load the rotor bearing takes from the rotor orbiting the e-shaft.' , conv: 'force' },
     ],
   },
 ];
@@ -81,10 +91,11 @@ const GROUPS: { id: string; name: string; fields: Field[] }[] = [
 export interface PanelHooks {
   onChange(key: keyof Tune): void;
   getLive(): { rpm: number; map: number };
+  imperial(): boolean;
 }
 
 export class TunePanel {
-  private inputs: { f: Field; num: HTMLInputElement; range: HTMLInputElement; row: HTMLElement }[] = [];
+  private inputs: { f: Field; num: HTMLInputElement; range: HTMLInputElement; row: HTMLElement; unit: HTMLElement }[] = [];
   private notesEl!: HTMLElement;
   private sparkNote!: HTMLElement;
   private layoutSel!: HTMLSelectElement;
@@ -219,6 +230,13 @@ export class TunePanel {
     return row;
   }
 
+  // factor, unit and decimals to show this field in right now
+  private scale(f: Field): [number, string, number] {
+    if (!f.conv) return [1, f.unit, 2];
+    const c = CONV[f.conv];
+    return this.hooks.imperial() ? c.imp : c.met;
+  }
+
   private fieldRow(f: Field) {
     const row = el('div', 'field');
     const top = el('div', 'field-top');
@@ -232,7 +250,8 @@ export class TunePanel {
     num.min = String(f.min);
     num.max = String(f.max);
     num.step = String(f.step);
-    numWrap.append(num, text('span', 'unit', f.unit));
+    const unitEl = text('span', 'unit', f.unit);
+    numWrap.append(num, unitEl);
     top.append(lab, numWrap);
     const range = document.createElement('input');
     range.type = 'range';
@@ -248,10 +267,10 @@ export class TunePanel {
       this.sync();
     };
     range.oninput = () => apply(+range.value);
-    num.onchange = () => apply(+num.value);
+    num.onchange = () => apply(+num.value / this.scale(f)[0]);
     row.append(top, range);
     if (f.hint) row.append(text('p', 'hint', f.hint));
-    this.inputs.push({ f, num, range, row });
+    this.inputs.push({ f, num, range, row, unit: unitEl });
     return row;
   }
 
@@ -482,17 +501,24 @@ export class TunePanel {
       kind === 'rotary'
         ? 'Ignition advance in e-shaft degrees before TDC. Rows are manifold pressure, columns are rpm. The outlined cell is where the engine is running right now.'
         : 'Ignition advance in degrees before TDC. Rows are manifold pressure, columns are rpm. The outlined cell is where the engine is running right now.';
-    for (const { f, num, range, row } of this.inputs) {
+    for (const { f, num, range, row, unit } of this.inputs) {
       row.hidden = f.only === 'pushrod' ? !pushrod : f.only === 'turbo' ? !t.turbo : !!f.only && f.only !== kind;
       const k = f.key;
       const v = t[k] as number;
-      if (document.activeElement !== num) num.value = String(+v.toFixed(2));
+      const [k2, u, d] = this.scale(f);
+      unit.textContent = u;
+      num.step = f.conv ? 'any' : String(f.step);
+      if (document.activeElement !== num) num.value = String(+(v * k2).toFixed(d));
       range.value = String(v);
       range.style.setProperty('--fill', `${((v - +range.min) / (+range.max - +range.min)) * 100}%`);
     }
     this.paintCells();
     this.paintSel();
     this.updateDerived();
+  }
+
+  private speed(ms: number) {
+    return this.hooks.imperial() ? `${Math.round(ms * 196.85).toLocaleString()} ft/min` : `${ms.toFixed(1)} m/s`;
   }
 
   updateDerived(extra?: { floatRpm: number; rodRpm: number }) {
@@ -515,7 +541,7 @@ export class TunePanel {
       const rotors = lay.rotors!.length;
       set('disp', `${rotors} x ${Math.round(face)} cc`);
       set('rs', '');
-      set('ps', `${(((t.rotorR + t.rotorE) / 1000) * (t.revLimit / 3) * (Math.PI / 30)).toFixed(1)} m/s`);
+      set('ps', this.speed(((t.rotorR + t.rotorE) / 1000) * (t.revLimit / 3) * (Math.PI / 30)));
       set('lsa', '');
       set('overlap', `${Math.max(0, t.portEC - t.portIO)}°`);
       set('ivc', `${t.portIC}° ABDC`);
@@ -533,7 +559,7 @@ export class TunePanel {
     const disp = (Math.PI / 4) * (t.bore / 10) ** 2 * (t.stroke / 10) * n;
     set('disp', `${(disp / 1000).toFixed(2)} L, ${Math.round(disp / 16.387)} ci`);
     set('rs', (t.rod / t.stroke).toFixed(2));
-    set('ps', `${((2 * t.stroke * t.revLimit) / 60000).toFixed(1)} m/s`);
+    set('ps', this.speed((2 * t.stroke * t.revLimit) / 60000));
     const lsa = (t.inCenterline + t.exCenterline) / 2;
     set('lsa', `${lsa.toFixed(1)}°`);
     const ivo = t.inCenterline - t.inDuration / 2; // ATDC, negative means BTDC

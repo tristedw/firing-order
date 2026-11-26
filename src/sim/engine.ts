@@ -76,6 +76,8 @@ export interface CylState {
   workAcc: number; // J this cycle
   imep: number; // Pa
   gasket: number; // 0..1, cumulative over pressure
+  misfires: number; // cycles that should have lit and didn't
+  knocks: number;
   residual: number; // burnt gas fraction left in the charge at spark
   revert: number; // kg of exhaust pushed back up the intake during overlap, comes back first
   unburnt: boolean; // last charge went out the exhaust without lighting
@@ -213,6 +215,8 @@ export class Engine {
   chargeT = T_AMB;
   emap = PATM;
   bovOpen = false;
+  missLog: number[] = []; // sim times, for a per minute rate
+  knockLog: number[] = [];
   bovFired = false;
   surging = false;
   surgeClock = 0;
@@ -391,6 +395,8 @@ export class Engine {
       workAcc: 0,
       imep: 0,
       gasket: 0,
+      misfires: 0,
+      knocks: 0,
       residual: 0,
       revert: 0,
       unburnt: false,
@@ -593,6 +599,22 @@ export class Engine {
     this.turboDead = true;
     this.failure = { kind: 'turbo', cyl: 0, rpm: this.rpm };
     this.events.push({ type: 'failure', cyl: 0, t: 0, amp: 0.6 });
+  }
+
+  // events per minute over the last few seconds of sim time
+  rate(log: number[], window = 6) {
+    const from = this.simTime - window;
+    while (log.length && log[0] < from) log.shift();
+    return (log.length / Math.min(window, Math.max(0.5, this.simTime))) * 60;
+  }
+
+  resetCounts() {
+    for (const c of this.cyls) {
+      c.misfires = 0;
+      c.knocks = 0;
+    }
+    this.missLog.length = 0;
+    this.knockLog.length = 0;
   }
 
   rodLoad() {
@@ -858,6 +880,11 @@ export class Engine {
         const dilMiss = fuelOn && Math.random() < pMiss;
         const misfire = !fuelOn || dilMiss;
         if (dilMiss) c.unburnt = true;
+        // count the ones nobody asked for: not the limiter, not a cut button
+        if (!this.starter && rpm > 400 && (dilMiss || (!this.fuelCut && !this.killed.has(c.idx) && !c.dead && lambda > 1.6))) {
+          c.misfires++;
+          this.missLog.push(this.simTime);
+        }
         if (!misfire) {
           let eff: number;
           if (lambda <= 1) eff = 1 - 2.2 * (lambda - 0.87) ** 2;
@@ -910,6 +937,10 @@ export class Engine {
               if (this.knockControl) c.knockRetard = Math.min(10, c.knockRetard + 2 * intensity + 0.5);
               dQ *= 1.2; // pressure spike
               this.events.push({ type: 'knock', cyl: c.idx, t: tAt, amp: intensity });
+              if (!this.starter && rpm > 400) {
+                c.knocks++;
+                this.knockLog.push(this.simTime);
+              }
             }
           }
           if (c.xb >= 0.999) c.burning = false;

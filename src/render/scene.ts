@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import type { Engine, CylState } from '../sim/engine';
+import { buildTurboKit, type TurboKit } from './turbo';
 
 // 1 scene unit = 10 cm
 const S = 10;
@@ -107,7 +108,9 @@ export class EngineView {
   crank = new THREE.Group();
   flywheel = new THREE.Group();
   blockCam = new THREE.Group();
-  turbo: { group: THREE.Group; wheel: THREE.Group; twheel: THREE.Group; hot: THREE.MeshStandardMaterial; angle: number; last: number } | null = null;
+  turbo: (TurboKit & { angle: number; last: number }) | null = null;
+  private exTips: [THREE.Object3D, THREE.Vector3][] = [];
+  private inTops: [THREE.Object3D, THREE.Vector3][] = [];
   cyls: CylMeshes[] = [];
   rotors: RotorMeshes[] = [];
   shaft = new THREE.Group();
@@ -199,6 +202,8 @@ export class EngineView {
     this.selected = null;
     this.highlightSaved.clear();
     this.turbo = null;
+    this.exTips = [];
+    this.inTops = [];
     if (e.kind === 'rotary') this.buildRotary(e);
     else this.buildPiston(e);
     if (e.tune.turbo) this.buildTurbo(e);
@@ -393,6 +398,7 @@ export class EngineView {
       const runnerPts = [new THREE.Vector3(ip.x, ip.y, b * 0.5), new THREE.Vector3(ip.x, ip.y, b * 0.9), new THREE.Vector3(ip.x * 1.4, ip.y + R * 0.6, b * 1.1), new THREE.Vector3(ip.x * 1.5, ip.y + R * 1.3, b * 1.1)];
       const runner = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(runnerPts), 24, R * 0.13, 12, false), new THREE.MeshStandardMaterial({ color: 0x8d969d, metalness: 0.6, roughness: 0.5, transparent: true, opacity: 0.6 }));
       intake.add(runner);
+      this.inTops.push([intake, runnerPts[3]]);
       const portFace = new THREE.Mesh(new THREE.CircleGeometry(R * 0.14, 24), new THREE.MeshBasicMaterial({ color: 0x3d7bea, transparent: true, opacity: 0.5, side: THREE.DoubleSide }));
       portFace.position.set(ip.x, ip.y, b * 0.505);
       intake.add(portFace);
@@ -412,6 +418,7 @@ export class EngineView {
       const exMat = new THREE.MeshStandardMaterial({ color: 0x4f4a45, metalness: 0.8, roughness: 0.5, emissive: 0x000000 });
       const exhaust = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(exPts), 32, R * 0.14, 14, false), exMat);
       g.add(exhaust);
+      this.exTips.push([exhaust, exPts[3]]);
       this.tag(exhaust, { kind: 'exhaust-valve', cyl: ri * 3 });
 
       const faces = [0, 1, 2].map((f) => lay.cyls.findIndex((c) => c.rotor === ri && c.face === f));
@@ -771,6 +778,7 @@ export class EngineView {
       const header = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3([p0, p1, p2, p3]), 32, 0.16 * B, 14, false), headerMat);
       header.castShadow = true;
       group.add(header);
+      this.exTips.push([group, p3]);
 
       // intake runner
       const q0 = new THREE.Vector3(0, deckY + 0.2 * B, valveSide * 0.55 * B);
@@ -778,6 +786,7 @@ export class EngineView {
       const q2 = new THREE.Vector3(0, deckY + 1.3 * B, valveSide * 1.05 * B);
       const runner = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3([q0, q1, q2]), 24, 0.15 * B, 12, false), new THREE.MeshStandardMaterial({ color: 0x8d969d, metalness: 0.6, roughness: 0.5, transparent: true, opacity: 0.55 }));
       group.add(runner);
+      this.inTops.push([group, q2]);
 
       this.cyls.push({ group, piston, rod, gas, gasMat, inValve, exValve, inSpring, exSpring, inLobe, exLobe, light, plugTip: tip, plugMat, header, headerMat, liner, deckY, pinToTop: ch, push });
     });
@@ -794,92 +803,28 @@ export class EngineView {
     void maxTop;
   }
 
-  // a snail on the side of the engine: cast iron turbine on the exhaust end, alloy compressor
-  // on the intake end, wheels on one shaft through the center section
+  // turbo with its plumbing, piped to the header tips and intake runners gathered during the build
   private buildTurbo(e: Engine) {
+    this.root.updateMatrixWorld(true);
+    const toRoot = (o: THREE.Object3D, p: THREE.Vector3) => this.root.worldToLocal(o.localToWorld(p.clone()));
+    const exTips = this.exTips.map(([o, p]) => toRoot(o, p));
+    const inTops = this.inTops.map(([o, p]) => toRoot(o, p));
+    if (!exTips.length || !inTops.length) return;
     const box = new THREE.Box3().setFromObject(this.root);
-    const sz = box.getSize(new THREE.Vector3());
-    const k = (e.tune.turboSize / 56) * Math.max(0.12, Math.min(0.32, sz.y * 0.22));
-    const g = new THREE.Group();
-    const snail = (r: number, tube: number, m: THREE.Material) => {
-      const s = new THREE.Group();
-      // volute grows as it wraps round, like the real casting
-      const pts: THREE.Vector3[] = [];
-      for (let i = 0; i <= 40; i++) {
-        const a = (i / 40) * Math.PI * 1.9;
-        pts.push(new THREE.Vector3(0, Math.cos(a) * r, Math.sin(a) * r));
-      }
-      const curve = new THREE.CatmullRomCurve3(pts);
-      const geo = new THREE.TubeGeometry(curve, 48, tube, 12, false);
-      // taper the tube by squashing radius along its length
-      const pos = geo.attributes.position;
-      const v = new THREE.Vector3();
-      for (let i = 0; i < pos.count; i++) {
-        v.fromBufferAttribute(pos, i);
-        const a = Math.atan2(v.z, v.y);
-        const u = ((a + Math.PI * 2) % (Math.PI * 2)) / (Math.PI * 1.9);
-        const rr = Math.hypot(v.y, v.z);
-        const scale = 0.55 + 0.45 * Math.min(1, u);
-        const off = (rr - r) * scale + r;
-        v.y *= off / rr;
-        v.z *= off / rr;
-        v.x *= scale;
-        pos.setXYZ(i, v.x, v.y, v.z);
-      }
-      geo.computeVertexNormals();
-      s.add(new THREE.Mesh(geo, m));
-      const disc = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.95, r * 0.95, tube * 1.2, 32).rotateZ(Math.PI / 2), m);
-      s.add(disc);
-      return s;
-    };
-    const alu = mat(0xb9bec2, 0.9, 0.42);
-    const hot = mat(0x4a4642, 0.85, 0.6);
-    hot.emissive = new THREE.Color(0x000000);
-    const comp = snail(k * 0.9, k * 0.42, alu);
-    comp.position.x = -k * 0.75;
-    g.add(comp);
-    const turb = snail(k * 0.78, k * 0.38, hot);
-    turb.position.x = k * 0.75;
-    g.add(turb);
-    const chra = new THREE.Mesh(new THREE.CylinderGeometry(k * 0.36, k * 0.36, k * 0.9, 20).rotateZ(Math.PI / 2), mat(0x7a7f84, 1, 0.35));
-    g.add(chra);
-    // compressor inlet with the wheel showing through
-    const inlet = new THREE.Mesh(new THREE.CylinderGeometry(k * 0.5, k * 0.56, k * 0.7, 28, 1, true).rotateZ(Math.PI / 2), alu);
-    inlet.material = alu.clone();
-    (inlet.material as THREE.MeshStandardMaterial).side = THREE.DoubleSide;
-    inlet.position.x = -k * 1.45;
-    g.add(inlet);
-    const wheel = new THREE.Group();
-    const bladeMat = mat(0xd9dde0, 1, 0.25);
-    for (let i = 0; i < 12; i++) {
-      const bl = new THREE.Mesh(new THREE.BoxGeometry(k * 0.55, k * 0.44, k * 0.03), bladeMat);
-      bl.position.set(0, Math.cos((i / 12) * Math.PI * 2) * k * 0.22, Math.sin((i / 12) * Math.PI * 2) * k * 0.22);
-      bl.rotation.x = (i / 12) * Math.PI * 2 + Math.PI / 2;
-      bl.rotation.y = 0.35;
-      wheel.add(bl);
-    }
-    const nut = new THREE.Mesh(new THREE.ConeGeometry(k * 0.12, k * 0.3, 14).rotateZ(Math.PI / 2), bladeMat);
-    nut.position.x = -k * 0.3;
-    wheel.add(nut);
-    wheel.position.x = -k * 1.35;
-    g.add(wheel);
-    const twheel = new THREE.Group();
-    for (let i = 0; i < 9; i++) {
-      const bl = new THREE.Mesh(new THREE.BoxGeometry(k * 0.3, k * 0.36, k * 0.03), mat(0x5c5752, 1, 0.5));
-      bl.position.set(0, Math.cos((i / 9) * Math.PI * 2) * k * 0.2, Math.sin((i / 9) * Math.PI * 2) * k * 0.2);
-      bl.rotation.x = (i / 9) * Math.PI * 2 + Math.PI / 2;
-      twheel.add(bl);
-    }
-    twheel.position.x = k * 1.15;
-    g.add(twheel);
-    // downpipe stub out the turbine
-    const dp = new THREE.Mesh(new THREE.CylinderGeometry(k * 0.4, k * 0.4, k * 1.2, 20).rotateZ(Math.PI / 2), hot);
-    dp.position.x = k * 1.6;
-    g.add(dp);
-    g.position.set(box.max.x - sz.x * 0.3, box.min.y + sz.y * 0.55, box.max.z + k * 1.3);
-    this.root.add(g);
-    this.tag(g, { kind: 'turbo', cyl: -1 });
-    this.turbo = { group: g, wheel, twheel, hot, angle: 0, last: performance.now() };
+    const kit = buildTurboKit({
+      inducerMm: e.tune.turboSize,
+      S,
+      B: e.kind === 'rotary' ? e.rotB * S * 1.1 : e.B * S,
+      exTips,
+      inTops,
+      box,
+      front: e.kind === 'rotary' ? 1 : -1,
+      intercooler: e.tune.intercooler,
+      bov: e.tune.bov,
+    });
+    this.root.add(kit.group);
+    this.tag(kit.group, { kind: 'turbo', cyl: -1 });
+    this.turbo = { ...kit, angle: 0, last: performance.now() };
   }
 
   private updateTurbo(e: Engine) {
@@ -888,16 +833,27 @@ export class EngineView {
     const now = performance.now();
     const dt = Math.min(0.05, (now - tb.last) / 1000);
     tb.last = now;
-    // real shaft speed would just strobe, so show it slowed right down
+    // the real shaft would just strobe, so show it slowed right down
     tb.angle += (e.turboDead ? 0 : e.spool) * 38 * dt;
     tb.wheel.rotation.x = tb.angle;
     tb.twheel.rotation.x = tb.angle;
+    tb.blade.rotation.z = (e.throttle * Math.PI) / 2.2;
     const egt = e.cyls.reduce((a, c) => a + c.egt, 0) / Math.max(1, e.cyls.length);
     const glow = Math.max(0, Math.min(1, (egt - 960) / 380));
-    tb.hot.emissive.setRGB(glow * 0.9, glow * 0.22, 0);
+    for (const m of tb.hot) m.emissive.setRGB(glow * 0.9, glow * 0.22, 0);
   }
 
   private finish() {
+    // open tube ends, lathes and hand built meshes can show their back faces.
+    // render both sides on everything solid so nothing ever looks turned inside out
+    this.root.traverse((o) => {
+      const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+      if (!m || !(o as THREE.Mesh).isMesh) return;
+      for (const mm of Array.isArray(m) ? m : [m]) {
+        if (!mm.transparent) mm.side = THREE.DoubleSide;
+        mm.shadowSide = THREE.FrontSide;
+      }
+    });
     // set it on the floor and frame it
     const box = new THREE.Box3().setFromObject(this.root);
     const lowest = box.min.y;

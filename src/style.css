@@ -762,6 +762,34 @@ input[type='range']::-moz-range-thumb {
   width: 0;
   background: var(--heat);
 }
+.cyl .counts {
+  display: flex;
+  justify-content: center;
+  gap: 4px;
+  min-height: 14px;
+  font-size: 10px;
+  line-height: 14px;
+}
+.cyl .counts b {
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: 3px;
+}
+.cyl .counts .m {
+  background: var(--panel-2);
+  color: var(--ink-2);
+}
+.cyl .counts .k {
+  background: #fbe9c4;
+  color: #7a5200;
+}
+.resettable {
+  cursor: pointer;
+}
+.resettable:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
 .cyl .cut {
   border: 1px solid var(--line);
   background: transparent;
