@@ -11,10 +11,10 @@ interface Field {
   max: number;
   step: number;
   hint?: string;
-  only?: 'piston' | 'rotary' | 'pushrod';
+  only?: 'piston' | 'rotary' | 'pushrod' | 'turbo';
 }
 
-export const GEOMETRY_KEYS = new Set<keyof Tune>(['valvetrain', 'rockerRatio', 'layout', 'bore', 'stroke', 'rod', 'compression', 'inDuration', 'exDuration', 'inLift', 'exLift', 'rotorR', 'rotorE', 'rotorB']);
+export const GEOMETRY_KEYS = new Set<keyof Tune>(['turbo', 'turboSize', 'valvetrain', 'rockerRatio', 'layout', 'bore', 'stroke', 'rod', 'compression', 'inDuration', 'exDuration', 'inLift', 'exLift', 'rotorR', 'rotorE', 'rotorB']);
 
 const GROUPS: { id: string; name: string; fields: Field[] }[] = [
   {
@@ -45,7 +45,7 @@ const GROUPS: { id: string; name: string; fields: Field[] }[] = [
       { key: 'exLift', label: 'Exhaust lift', unit: 'mm', min: 4, max: 17, step: 0.1, only: 'piston' },
       { key: 'rockerRatio', label: 'Rocker ratio', unit: ':1', min: 1.3, max: 2, step: 0.05, only: 'pushrod', hint: 'Valve lift is lobe lift times this. LS heads run 1.7, a small block Chevy 1.5.' },
       { key: 'springRate', label: 'Valve springs', unit: '×', min: 0.6, max: 2, step: 0.05, only: 'piston', hint: 'Stiffer springs push valve float higher. Pushrod valvetrains carry more weight and float a bit sooner.' },
-      { key: 'portIO', label: 'Intake opens', unit: '° ATDC', min: -10, max: 60, step: 1, only: 'rotary', hint: 'E-shaft degrees. Porting a rotary is the same game as picking a cam: open earlier and close later for top end.' },
+      { key: 'portIO', label: 'Intake opens', unit: '° ATDC', min: -80, max: 60, step: 1, only: 'rotary', hint: 'E-shaft degrees. Porting a rotary is the same game as picking a cam: open earlier and close later for top end.' },
       { key: 'portIC', label: 'Intake closes', unit: '° ABDC', min: 20, max: 100, step: 1, only: 'rotary' },
       { key: 'portEO', label: 'Exhaust opens', unit: '° BBDC', min: 30, max: 100, step: 1, only: 'rotary' },
       { key: 'portEC', label: 'Exhaust closes', unit: '° ATDC', min: -10, max: 70, step: 1, only: 'rotary', hint: 'Negative means before TDC. Peripheral exhaust ports close late and overlap with the intake.' },
@@ -60,7 +60,8 @@ const GROUPS: { id: string; name: string; fields: Field[] }[] = [
       { key: 'octane', label: 'Fuel octane', unit: 'AKI', min: 80, max: 110, step: 1 },
       { key: 'runner', label: 'Intake runner', unit: 'mm', min: 100, max: 600, step: 5 },
       { key: 'tbMm', label: 'Throttle body', unit: 'mm', min: 0, max: 120, step: 1, hint: '0 sizes it from displacement.' },
-      { key: 'boost', label: 'Turbo boost', unit: 'psi', min: 0, max: 30, step: 0.5, hint: '0 for naturally aspirated.' },
+      { key: 'boost', label: 'Wastegate', unit: 'psi', min: 2, max: 35, step: 0.5, only: 'turbo', hint: 'Boost the gate holds once the turbo is lit. More boost means more heat in the charge and more pressure in the cylinder.' },
+      { key: 'turboSize', label: 'Compressor inducer', unit: 'mm', min: 38, max: 90, step: 1, only: 'turbo', hint: 'Bigger flows more air up top but needs more exhaust to wake up. Too small and it chokes and oversped.' },
     ],
   },
   {
@@ -70,6 +71,8 @@ const GROUPS: { id: string; name: string; fields: Field[] }[] = [
       { key: 'revLimit', label: 'Rev limiter', unit: 'rpm', min: 2000, max: 12000, step: 50 },
       { key: 'idleRpm', label: 'Idle target', unit: 'rpm', min: 500, max: 2000, step: 10 },
       { key: 'rodStrength', label: 'Rod strength', unit: 'kN', min: 4, max: 60, step: 0.5, only: 'piston', hint: 'How much inertial pull the rods take before one snaps. Forged rods buy you rpm.' },
+      { key: 'pressureLimit', label: 'Head gasket holds', unit: 'bar', min: 50, max: 160, step: 1, only: 'piston', hint: 'Peak cylinder pressure before the gasket starts to give. MLS gaskets and head studs move this up.' },
+      { key: 'pressureLimit', label: 'Seals hold', unit: 'bar', min: 50, max: 140, step: 1, only: 'rotary', hint: 'Peak chamber pressure the side and corner seals take before they start blowing by.' },
       { key: 'rodStrength', label: 'Rotor bearing rating', unit: 'kN', min: 20, max: 160, step: 1, only: 'rotary', hint: 'Load the rotor bearing takes from the rotor orbiting the e-shaft.' },
     ],
   },
@@ -87,6 +90,7 @@ export class TunePanel {
   private layoutSel!: HTMLSelectElement;
   private vtSel!: HTMLSelectElement;
   private vtRow!: HTMLElement;
+  private toggles: { key: 'turbo' | 'intercooler' | 'bov'; box: HTMLInputElement; row: HTMLElement; turboOnly: boolean }[] = [];
   private derived = new Map<string, HTMLElement>();
   private cells: HTMLElement[][] = [];
   private sel = { r0: 0, c0: 0, r1: 0, c1: 0, active: false };
@@ -130,7 +134,14 @@ export class TunePanel {
       sec.dataset.pane = g.id;
       if (g.id === 'engine') sec.append(this.layoutRow());
       if (g.id === 'cam') sec.append(this.valvetrainRow());
-      for (const f of g.fields) sec.append(this.fieldRow(f));
+      for (const f of g.fields) {
+        if (f.key === 'boost') sec.append(this.toggleRow('turbo', 'Turbo', 'Exhaust drives a turbine, the turbine spins a compressor, the compressor packs the intake.', false));
+        sec.append(this.fieldRow(f));
+      }
+      if (g.id === 'fuel') {
+        sec.append(this.toggleRow('intercooler', 'Intercooler', 'Pulls most of the compressor heat back out before it reaches the engine. Hot charge is less dense and knocks sooner.', true));
+        sec.append(this.toggleRow('bov', 'Blow off valve', 'Vents boost when you lift. Without it the air bangs back through the compressor and it surges.', true));
+      }
       sec.append(this.derivedBlock(g.id));
       body.append(sec);
     }
@@ -189,6 +200,22 @@ export class TunePanel {
     this.vtSel = s;
     this.vtRow = row;
     row.append(s);
+    return row;
+  }
+
+  private toggleRow(key: 'turbo' | 'intercooler' | 'bov', label: string, hint: string, turboOnly: boolean) {
+    const row = el('div', 'field field-toggle');
+    const lab = el('label', 'check');
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.onchange = () => {
+      this.tune()[key] = box.checked;
+      this.hooks.onChange(key);
+      this.sync();
+    };
+    lab.append(box, document.createTextNode(label));
+    row.append(lab, text('p', 'hint', hint));
+    this.toggles.push({ key, box, row, turboOnly });
     return row;
   }
 
@@ -443,6 +470,10 @@ export class TunePanel {
     this.vtSel.value = t.valvetrain ?? 'ohc';
     this.vtRow.hidden = kind === 'rotary';
     const pushrod = kind === 'piston' && t.valvetrain === 'pushrod';
+    for (const g of this.toggles) {
+      g.box.checked = !!t[g.key];
+      g.row.hidden = g.turboOnly && !t.turbo;
+    }
     this.notesEl.textContent = t.notes ?? '';
     this.notesEl.hidden = !t.notes;
     const camTab = this.host.querySelector<HTMLElement>('.tab[data-tab="cam"]');
@@ -452,7 +483,7 @@ export class TunePanel {
         ? 'Ignition advance in e-shaft degrees before TDC. Rows are manifold pressure, columns are rpm. The outlined cell is where the engine is running right now.'
         : 'Ignition advance in degrees before TDC. Rows are manifold pressure, columns are rpm. The outlined cell is where the engine is running right now.';
     for (const { f, num, range, row } of this.inputs) {
-      row.hidden = f.only === 'pushrod' ? !pushrod : !!f.only && f.only !== kind;
+      row.hidden = f.only === 'pushrod' ? !pushrod : f.only === 'turbo' ? !t.turbo : !!f.only && f.only !== kind;
       const k = f.key;
       const v = t[k] as number;
       if (document.activeElement !== num) num.value = String(+v.toFixed(2));

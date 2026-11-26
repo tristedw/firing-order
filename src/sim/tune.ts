@@ -24,7 +24,12 @@ export interface Tune {
   octane: number;
   revLimit: number;
   idleRpm: number;
-  boost: number; // psi, 0 = naturally aspirated
+  turbo: boolean;
+  boost: number; // psi, wastegate setting
+  turboSize: number; // compressor inducer mm, bigger flows more and spools later
+  intercooler: boolean;
+  bov: boolean; // blow off valve, without one the compressor surges on lift off
+  pressureLimit: number; // bar of peak cylinder pressure the head gasket (or rotary seals) hold
   flywheel: number; // inertia multiplier
   recipMass: number; // grams, piston + pin + rings + small end
   rodStrength: number; // kN of inertial tension the rods survive
@@ -70,7 +75,12 @@ const base: Omit<Tune, 'name' | 'layout' | 'bore' | 'stroke' | 'rod'> = {
   octane: 91,
   revLimit: 6800,
   idleRpm: 750,
-  boost: 0,
+  turbo: false,
+  boost: 8,
+  turboSize: 56,
+  intercooler: true,
+  bov: true,
+  pressureLimit: 80,
   flywheel: 1,
   recipMass: 520,
   rodStrength: 20,
@@ -226,7 +236,10 @@ export const PRESETS: Tune[] = [
     exCenterline: 114,
     inLift: 10,
     exLift: 9.6,
+    turbo: true,
     boost: 14,
+    turboSize: 54,
+    pressureLimit: 95,
     afrWot: 11.8,
     springRate: 1.15,
     octane: 94,
@@ -335,7 +348,10 @@ export const PRESETS: Tune[] = [
     portIC: 50,
     portEO: 75,
     portEC: 48,
+    turbo: true,
     boost: 10,
+    turboSize: 50,
+    pressureLimit: 82,
     afrWot: 11.3,
     octane: 94,
     revLimit: 8000,
@@ -345,6 +361,29 @@ export const PRESETS: Tune[] = [
     spark: makeSpark(26, 8, 6, 4500),
     recipMass: 4600,
     notes: 'FD RX-7. Peripheral exhaust port gives the long overlap and the lumpy idle. Spark and port timing are in e-shaft degrees.',
+  },
+  {
+    ...base,
+    name: '13B bridgeport',
+    bore: 86,
+    stroke: 86,
+    rod: 143,
+    layout: 'rotary-2',
+    compression: 9.4,
+    portIO: -55,
+    portIC: 70,
+    portEO: 75,
+    portEC: 48,
+    octane: 94,
+    afrWot: 12.4,
+    revLimit: 9500,
+    idleRpm: 1300,
+    runner: 200,
+    tbMm: 0,
+    flywheel: 0.9,
+    spark: makeSpark(28, 14, 8, 6000),
+    recipMass: 4600,
+    notes: 'NA 13B with the intake ports bridged through to the housing, so the intake opens way before TDC while the peripheral exhaust is still open. Over 100 deg of overlap: half the idle charge is old exhaust, cycles drop out and you get the brap.',
   },
   {
     ...base,
@@ -358,7 +397,10 @@ export const PRESETS: Tune[] = [
     portIC: 50,
     portEO: 75,
     portEC: 48,
+    turbo: true,
     boost: 4,
+    turboSize: 60,
+    pressureLimit: 82,
     afrWot: 11.4,
     octane: 94,
     revLimit: 7500,
@@ -398,6 +440,7 @@ for (const p of PRESETS) {
   const w = ((p.revLimit * 1.18) * 2 * Math.PI) / 60;
   const m = p.recipMass / 1000;
   if (p.layout.startsWith('rotary')) {
+    if (p.pressureLimit === base.pressureLimit) p.pressureLimit = 72;
     p.rodStrength = Math.round((m * (p.rotorE / 1000) * w * w) / 100) / 10;
   } else {
     const r = p.stroke / 2000;
@@ -423,6 +466,8 @@ export function decodeTune(s: string): Tune | null {
     const t = JSON.parse(json) as Tune;
     if (!t || typeof t.bore !== 'number' || !Array.isArray(t.spark)) return null;
     if (t.spark.length !== SPARK_MAP.length || t.spark[0].length !== SPARK_RPM.length) return null;
+    // links from before the turbo toggle: any boost meant a turbo
+    if (t.turbo === undefined && typeof t.boost === 'number') t.turbo = t.boost > 0;
     return { ...PRESETS[0], ...t };
   } catch {
     return null;

@@ -7,7 +7,7 @@ import type { Engine, CylState } from '../sim/engine';
 const S = 10;
 const DEG = Math.PI / 180;
 
-export type PartKind = 'piston' | 'rod' | 'crank' | 'intake-valve' | 'exhaust-valve' | 'cam' | 'flywheel' | 'plug' | 'cylinder' | 'rotor' | 'pushrod';
+export type PartKind = 'piston' | 'rod' | 'crank' | 'intake-valve' | 'exhaust-valve' | 'cam' | 'flywheel' | 'plug' | 'cylinder' | 'rotor' | 'pushrod' | 'turbo';
 
 export interface PartHit {
   kind: PartKind;
@@ -107,6 +107,7 @@ export class EngineView {
   crank = new THREE.Group();
   flywheel = new THREE.Group();
   blockCam = new THREE.Group();
+  turbo: { group: THREE.Group; wheel: THREE.Group; twheel: THREE.Group; hot: THREE.MeshStandardMaterial; angle: number; last: number } | null = null;
   cyls: CylMeshes[] = [];
   rotors: RotorMeshes[] = [];
   shaft = new THREE.Group();
@@ -197,8 +198,10 @@ export class EngineView {
     this.blockMats = [];
     this.selected = null;
     this.highlightSaved.clear();
+    this.turbo = null;
     if (e.kind === 'rotary') this.buildRotary(e);
     else this.buildPiston(e);
+    if (e.tune.turbo) this.buildTurbo(e);
     this.finish();
   }
 
@@ -791,6 +794,109 @@ export class EngineView {
     void maxTop;
   }
 
+  // a snail on the side of the engine: cast iron turbine on the exhaust end, alloy compressor
+  // on the intake end, wheels on one shaft through the center section
+  private buildTurbo(e: Engine) {
+    const box = new THREE.Box3().setFromObject(this.root);
+    const sz = box.getSize(new THREE.Vector3());
+    const k = (e.tune.turboSize / 56) * Math.max(0.12, Math.min(0.32, sz.y * 0.22));
+    const g = new THREE.Group();
+    const snail = (r: number, tube: number, m: THREE.Material) => {
+      const s = new THREE.Group();
+      // volute grows as it wraps round, like the real casting
+      const pts: THREE.Vector3[] = [];
+      for (let i = 0; i <= 40; i++) {
+        const a = (i / 40) * Math.PI * 1.9;
+        pts.push(new THREE.Vector3(0, Math.cos(a) * r, Math.sin(a) * r));
+      }
+      const curve = new THREE.CatmullRomCurve3(pts);
+      const geo = new THREE.TubeGeometry(curve, 48, tube, 12, false);
+      // taper the tube by squashing radius along its length
+      const pos = geo.attributes.position;
+      const v = new THREE.Vector3();
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i);
+        const a = Math.atan2(v.z, v.y);
+        const u = ((a + Math.PI * 2) % (Math.PI * 2)) / (Math.PI * 1.9);
+        const rr = Math.hypot(v.y, v.z);
+        const scale = 0.55 + 0.45 * Math.min(1, u);
+        const off = (rr - r) * scale + r;
+        v.y *= off / rr;
+        v.z *= off / rr;
+        v.x *= scale;
+        pos.setXYZ(i, v.x, v.y, v.z);
+      }
+      geo.computeVertexNormals();
+      s.add(new THREE.Mesh(geo, m));
+      const disc = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.95, r * 0.95, tube * 1.2, 32).rotateZ(Math.PI / 2), m);
+      s.add(disc);
+      return s;
+    };
+    const alu = mat(0xb9bec2, 0.9, 0.42);
+    const hot = mat(0x4a4642, 0.85, 0.6);
+    hot.emissive = new THREE.Color(0x000000);
+    const comp = snail(k * 0.9, k * 0.42, alu);
+    comp.position.x = -k * 0.75;
+    g.add(comp);
+    const turb = snail(k * 0.78, k * 0.38, hot);
+    turb.position.x = k * 0.75;
+    g.add(turb);
+    const chra = new THREE.Mesh(new THREE.CylinderGeometry(k * 0.36, k * 0.36, k * 0.9, 20).rotateZ(Math.PI / 2), mat(0x7a7f84, 1, 0.35));
+    g.add(chra);
+    // compressor inlet with the wheel showing through
+    const inlet = new THREE.Mesh(new THREE.CylinderGeometry(k * 0.5, k * 0.56, k * 0.7, 28, 1, true).rotateZ(Math.PI / 2), alu);
+    inlet.material = alu.clone();
+    (inlet.material as THREE.MeshStandardMaterial).side = THREE.DoubleSide;
+    inlet.position.x = -k * 1.45;
+    g.add(inlet);
+    const wheel = new THREE.Group();
+    const bladeMat = mat(0xd9dde0, 1, 0.25);
+    for (let i = 0; i < 12; i++) {
+      const bl = new THREE.Mesh(new THREE.BoxGeometry(k * 0.55, k * 0.44, k * 0.03), bladeMat);
+      bl.position.set(0, Math.cos((i / 12) * Math.PI * 2) * k * 0.22, Math.sin((i / 12) * Math.PI * 2) * k * 0.22);
+      bl.rotation.x = (i / 12) * Math.PI * 2 + Math.PI / 2;
+      bl.rotation.y = 0.35;
+      wheel.add(bl);
+    }
+    const nut = new THREE.Mesh(new THREE.ConeGeometry(k * 0.12, k * 0.3, 14).rotateZ(Math.PI / 2), bladeMat);
+    nut.position.x = -k * 0.3;
+    wheel.add(nut);
+    wheel.position.x = -k * 1.35;
+    g.add(wheel);
+    const twheel = new THREE.Group();
+    for (let i = 0; i < 9; i++) {
+      const bl = new THREE.Mesh(new THREE.BoxGeometry(k * 0.3, k * 0.36, k * 0.03), mat(0x5c5752, 1, 0.5));
+      bl.position.set(0, Math.cos((i / 9) * Math.PI * 2) * k * 0.2, Math.sin((i / 9) * Math.PI * 2) * k * 0.2);
+      bl.rotation.x = (i / 9) * Math.PI * 2 + Math.PI / 2;
+      twheel.add(bl);
+    }
+    twheel.position.x = k * 1.15;
+    g.add(twheel);
+    // downpipe stub out the turbine
+    const dp = new THREE.Mesh(new THREE.CylinderGeometry(k * 0.4, k * 0.4, k * 1.2, 20).rotateZ(Math.PI / 2), hot);
+    dp.position.x = k * 1.6;
+    g.add(dp);
+    g.position.set(box.max.x - sz.x * 0.3, box.min.y + sz.y * 0.55, box.max.z + k * 1.3);
+    this.root.add(g);
+    this.tag(g, { kind: 'turbo', cyl: -1 });
+    this.turbo = { group: g, wheel, twheel, hot, angle: 0, last: performance.now() };
+  }
+
+  private updateTurbo(e: Engine) {
+    const tb = this.turbo;
+    if (!tb) return;
+    const now = performance.now();
+    const dt = Math.min(0.05, (now - tb.last) / 1000);
+    tb.last = now;
+    // real shaft speed would just strobe, so show it slowed right down
+    tb.angle += (e.turboDead ? 0 : e.spool) * 38 * dt;
+    tb.wheel.rotation.x = tb.angle;
+    tb.twheel.rotation.x = tb.angle;
+    const egt = e.cyls.reduce((a, c) => a + c.egt, 0) / Math.max(1, e.cyls.length);
+    const glow = Math.max(0, Math.min(1, (egt - 960) / 380));
+    tb.hot.emissive.setRGB(glow * 0.9, glow * 0.22, 0);
+  }
+
   private finish() {
     // set it on the floor and frame it
     const box = new THREE.Box3().setFromObject(this.root);
@@ -851,6 +957,7 @@ export class EngineView {
       if (hit.kind === 'exhaust-valve') return [rm.exhaust];
       return [];
     }
+    if (hit.kind === 'turbo') return this.turbo ? [this.turbo.group] : [];
     if (hit.kind === 'crank') return [this.crank];
     if (hit.kind === 'flywheel') return [this.flywheel];
     if (hit.kind === 'cam' && hit.cyl < 0) return [this.blockCam, ...this.cyls.flatMap((c) => [c.inLobe, c.exLobe])];
@@ -893,6 +1000,7 @@ export class EngineView {
   }
 
   update(e: Engine) {
+    this.updateTurbo(e);
     if (this.rotors.length) return this.updateRotary(e);
     const r = e.r * S;
     const l = e.l * S;

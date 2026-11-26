@@ -788,6 +788,13 @@ input[type='range']::-moz-range-thumb {
   font-size: 13px;
   cursor: pointer;
 }
+.field-toggle .check {
+  font-weight: 500;
+  font-size: 14px;
+}
+.field-toggle .hint {
+  margin-left: 24px;
+}
 .check input {
   accent-color: var(--ink);
   width: 16px;

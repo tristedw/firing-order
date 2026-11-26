@@ -421,6 +421,7 @@ const PART_COPY: Record<PartHit['kind'], [string, string]> = {
   flywheel: ['Flywheel', 'Stores energy between power strokes so the engine keeps turning. The red mark lines up with crankpin 1.'],
   plug: ['Spark plug', 'Fires at the angle from the spark table. Too early and the unburnt gas lights off on its own. That is knock.'],
   cylinder: ['Cylinder', ''],
+  turbo: ['Turbo', 'Exhaust spins the turbine, the shaft spins the compressor, and the compressor packs air into the intake. Lag is the wheel getting up to speed. Run it past its map and the air gets hot, the turbine chokes the exhaust, and the wheel can overspeed.'],
   pushrod: ['Lifter, pushrod and rocker', 'One cam down in the block works every valve. The lifter rides the lobe, the pushrod carries the motion up to the rocker, and the rocker multiplies it by its ratio on the way to the valve.'],
   rotor: ['Rotor', 'Three flanks make three chambers. It turns once for every three turns of the e-shaft, kept in step by its ring gear walking round the fixed gear.'],
 };
@@ -496,7 +497,7 @@ function fillRotary(hit: PartHit) {
 function fillInspector() {
   if (!inspected) return;
   const hit = inspected;
-  if (engine.kind === 'rotary') return fillRotary(hit);
+  if (engine.kind === 'rotary' && hit.kind !== 'turbo') return fillRotary(hit);
   const c = hit.cyl >= 0 ? engine.cyls[hit.cyl] : null;
   const pushrodHead = tune.valvetrain === 'pushrod';
   const [title, desc] =
@@ -534,6 +535,24 @@ function fillInspector() {
       rows.push(['Torque right now', `${fmt(tq)} ${tu}`]);
       rows.push(['Speed', `${fmt(engine.rpm)} rpm`]);
       rows.push(['Pin angles', engine.layout.pins.map((p) => `${p.angle}°`).join(', ')]);
+      break;
+    }
+    case 'turbo': {
+      const r = engine.readings();
+      const tr = r.turbo;
+      if (!tr) break;
+      const [bp, bu] = U.boost(tr.boost);
+      const [ep, eu] = U.boost(tr.emap - 101325);
+      rows.push(['Shaft speed', tr.dead ? 'Wheel is gone' : `${fmt(Math.round(tr.shaftRpm / 1000))}k rpm`]);
+      rows.push(['Boost before throttle', `${fmt(bp, 1)} ${bu}`]);
+      rows.push(['Pressure ratio', `${fmt(tr.pr, 2)}`]);
+      rows.push(['Flow', `${fmt(tr.flow * 132.3, 1)} lb/min, ${fmt(tr.flowFrac * 100)}% of choke`]);
+      rows.push(['Compressor efficiency', `${fmt(tr.eff * 100)}%`]);
+      rows.push(['Off the compressor', `${fmt(U.temp(tr.compOutT)[0])} ${U.temp(tr.compOutT)[1]}`]);
+      rows.push(['Into the engine', `${fmt(U.temp(tr.chargeT)[0])} ${U.temp(tr.chargeT)[1]}`]);
+      rows.push(['Exhaust back pressure', `${fmt(ep, 1)} ${eu}`]);
+      rows.push(['Peak cylinder pressure', `${fmt(r.peakBar)} of ${fmt(r.pressureLimit)} bar`]);
+      if (tr.surging) rows.push(['Compressor', 'Surging']);
       break;
     }
     case 'pushrod': {
@@ -713,7 +732,7 @@ function updateReadouts() {
   const [pw, pu] = U.pw(Math.max(0, r.power));
   readEls.torque.innerHTML = `${fmt(tq)}<small>${tu}</small>`;
   readEls.power.innerHTML = `${fmt(pw)}<small>${pu}</small>`;
-  if (tune.boost > 0 && r.boost > 2000) {
+  if (tune.turbo && r.boost > 2000) {
     const [b, bu] = U.boost(r.boost);
     readEls.map.innerHTML = `${fmt(b, 1)}<small>${bu} boost</small>`;
   } else {
@@ -775,11 +794,15 @@ function updateReadouts() {
             rod: `Rotor ${rotor} spun its bearing at ${fmt(f.rpm)} rpm. The orbiting rotor pulled harder than the bearing was rated for.`,
             valve: `Something let go at ${fmt(f.rpm)} rpm.`,
             piston: `Detonation cracked an apex seal on chamber ${lbl}. The chamber has no compression now. Pull some timing or run better fuel.`,
+            gasket: `Chamber ${lbl} blew past its side seals at ${fmt(f.rpm)} rpm. Too much cylinder pressure for too long. Less boost, less timing, or stronger seals.`,
+            turbo: `The turbo oversped at ${fmt(f.rpm)} rpm and the compressor wheel let go. It was flowing way past its map. Engine still runs, just no boost. Go bigger on the turbo.`,
           }[f.kind]
         : {
             rod: `A rod let go in cylinder ${lbl} at ${fmt(f.rpm)} rpm. The inertia load passed what the rod was built for.`,
             valve: `Valve float at ${fmt(f.rpm)} rpm let a valve kiss the piston in cylinder ${lbl}. It is bent and the cylinder is dead.`,
             piston: `Detonation burned a hole through the piston in cylinder ${lbl}. Pull some timing or run better fuel.`,
+            gasket: `Blew the head gasket on cylinder ${lbl} at ${fmt(f.rpm)} rpm. Peak pressure sat over what it holds. Less boost, less timing, or head studs and a better gasket.`,
+            turbo: `The turbo oversped at ${fmt(f.rpm)} rpm and the compressor wheel let go. It was flowing way past its map. Engine still runs, just no boost. Go bigger on the turbo.`,
           }[f.kind];
     $('failure-text').textContent = what;
     $('failure').hidden = false;
@@ -821,7 +844,7 @@ function frame(now: number) {
   else engine.events.length = 0;
 
   const r = engine.readings();
-  sound.frame(engine.events, r, dragging ? 1 : timeScale);
+  sound.frame(engine, r, dragging ? 1 : timeScale);
 
   view.update(engine);
   view.render();

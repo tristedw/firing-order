@@ -17,7 +17,7 @@ const STOICH = 14.7;
 const T_AMB = 298;
 const DEG = Math.PI / 180;
 
-export type FailureKind = 'rod' | 'piston' | 'valve';
+export type FailureKind = 'rod' | 'piston' | 'valve' | 'gasket' | 'turbo';
 
 export interface Failure {
   kind: FailureKind;
@@ -26,7 +26,7 @@ export interface Failure {
 }
 
 export interface EngineEvent {
-  type: 'exhaust' | 'knock' | 'spark' | 'failure';
+  type: 'exhaust' | 'knock' | 'spark' | 'failure' | 'pop' | 'bov' | 'surge';
   cyl: number;
   t: number; // seconds of sim time since the start of this update() call
   amp: number;
@@ -75,6 +75,10 @@ export interface CylState {
   lambda: number;
   workAcc: number; // J this cycle
   imep: number; // Pa
+  gasket: number; // 0..1, cumulative over pressure
+  residual: number; // burnt gas fraction left in the charge at spark
+  revert: number; // kg of exhaust pushed back up the intake during overlap, comes back first
+  unburnt: boolean; // last charge went out the exhaust without lighting
 }
 
 export interface Readings {
@@ -98,6 +102,23 @@ export interface Readings {
   cranking: boolean;
   idleValve: number;
   spool: number;
+  turbo: TurboReadings | null;
+  peakBar: number; // highest cylinder pressure last cycle
+  pressureLimit: number; // bar
+}
+
+export interface TurboReadings {
+  shaftRpm: number;
+  boost: number; // Pa gauge in the charge pipe, before the throttle
+  pr: number; // pressure ratio across the compressor
+  flow: number; // kg/s through the compressor
+  flowFrac: number; // of the choke flow
+  eff: number; // compressor efficiency
+  chargeT: number; // K after the intercooler
+  compOutT: number; // K straight off the compressor
+  emap: number; // Pa exhaust manifold
+  surging: boolean;
+  dead: boolean;
 }
 
 export interface Trace {
@@ -105,6 +126,10 @@ export interface Trace {
   V: Float32Array; // m^3
   valid: boolean;
 }
+
+// share of the exhaust pushed into the runner that comes back to the same cylinder,
+// the rest mixes out into the plenum
+const REVERT_KEEP = 0.45;
 
 function clamp(v: number, a: number, b: number) {
   return v < a ? a : v > b ? b : v;
@@ -179,7 +204,18 @@ export class Engine {
   theta = 0; // crank or e-shaft deg, 0..cycleLen
   omega = 0; // rad/s
   pMan = PATM;
-  spool = 0;
+  spool = 0; // turbo shaft speed, 0..1 of its rated max
+  turboDead = false;
+  turboOver = 0; // seconds spent past the compressor map
+  boostUp = 0; // Pa gauge before the throttle
+  compEff = 0.72;
+  compOutT = T_AMB;
+  chargeT = T_AMB;
+  emap = PATM;
+  bovOpen = false;
+  bovFired = false;
+  surging = false;
+  surgeClock = 0;
   idleValve = 0.2;
   idleInt = 0;
   idleSpark = 0;
@@ -354,6 +390,10 @@ export class Engine {
       lambda: 1,
       workAcc: 0,
       imep: 0,
+      gasket: 0,
+      residual: 0,
+      revert: 0,
+      unburnt: false,
     };
     this.geom(c);
     c.m = (PATM * c.V) / (R * T_AMB);
@@ -367,7 +407,10 @@ export class Engine {
       c.damage = 0;
       c.dead = false;
       c.knockRetard = 0;
+      c.gasket = 0;
     });
+    this.turboDead = false;
+    this.turboOver = 0;
     this.floatTimer = 0;
     this.rodTimer = 0;
   }
@@ -545,6 +588,13 @@ export class Engine {
     }
   }
 
+  private failTurbo() {
+    // the compressor wheel lets go. engine lives, boost doesn't
+    this.turboDead = true;
+    this.failure = { kind: 'turbo', cyl: 0, rpm: this.rpm };
+    this.events.push({ type: 'failure', cyl: 0, t: 0, amp: 0.6 });
+  }
+
   rodLoad() {
     const m = this.tune.recipMass / 1000;
     if (this.kind === 'rotary') return m * this.rotE * this.omega * this.omega;
@@ -560,17 +610,71 @@ export class Engine {
     // upstream of the throttle: turbo compressor if fitted
     let pUp = PATM;
     let Tup = T_AMB;
-    if (t.boost > 0) {
-      const flowFull = (1.18 * this.VdTotal * 3200) / 120;
-      const target = clamp(this.exhFlowF / flowFull, 0, 1);
-      this.spool += (target - this.spool) * Math.min(1, h / 0.7);
-      const boostPa = t.boost * 6894.76 * this.spool * this.spool;
-      pUp = PATM + boostPa;
-      const tc = T_AMB * Math.pow(pUp / PATM, 0.286 / 0.72);
-      Tup = T_AMB + (tc - T_AMB) * 0.3; // intercooler
+    const turbo = t.turbo && !this.turboDead;
+    if (turbo) {
+      const size = t.turboSize / 56;
+      // a 56 mm inducer chokes somewhere near 0.42 kg/s, flow goes with wheel area
+      const choke = 0.42 * size * size;
+      // the turbine gets more out of hotter gas. a bigger wheel needs more of it to spin up
+      const egtAvg = this.cyls.reduce((a, c) => a + c.egt, 0) / this.cyls.length;
+      const drive = this.exhFlowF * clamp(egtAvg / 950, 0.4, 1.4);
+      const need = 0.16 * Math.pow(size, 2.3);
+      // pressure ratio climbs with the square of shaft speed, 3.6 at full speed
+      const prMax = 2.6;
+      const gatePa = Math.max(0, t.boost) * 6894.76;
+      const gateShaft = Math.sqrt(gatePa / (prMax * PATM));
+      let target = drive / need;
+      // wastegate bleeds the turbine once it makes the set boost
+      if (this.boostUp > gatePa * 0.92) target = Math.min(target, gateShaft * 1.02);
+      const flowFrac = this.airFlowF / choke;
+      // surge: lots of pressure, nowhere for the air to go. the wheel stalls and the air bangs back
+      const pr0 = 1 + prMax * this.spool * this.spool;
+      const surgeLine = 0.06 + 0.22 * (pr0 - 1);
+      this.bovOpen = t.bov && this.throttle < 0.12 && this.boostUp > 3000;
+      const wasSurging = this.surging;
+      this.surging = !t.bov && pr0 > 1.25 && flowFrac < surgeLine && this.throttle < 0.25;
+      // inertia of the wheel, a big turbo takes a while to wake up
+      const tau = 0.45 * Math.pow(size, 2.4) / clamp(drive / need, 0.35, 2);
+      const fall = this.surging ? 3 : this.bovOpen ? 1.6 : 1;
+      this.spool += (target - this.spool) * Math.min(1, (h * (target < this.spool ? fall : 1)) / tau);
+      this.spool = clamp(this.spool, 0, 1.3);
+      let boostPa = PATM * prMax * this.spool * this.spool;
+      // past choke the wheel just spins faster for no more air, pressure sags
+      const chokeLoss = clamp((flowFrac - 0.92) / 0.35, 0, 0.75);
+      boostPa = Math.min(boostPa, gatePa + 6000) * (1 - chokeLoss);
+      if (this.bovOpen) boostPa *= 0.15;
+      if (this.surging) {
+        // flutter: pressure in the charge pipe pulses as the wheel stalls and recovers
+        this.surgeClock += h * (9 + 10 * this.spool);
+        if (this.surgeClock >= 1) {
+          this.surgeClock -= 1;
+          this.events.push({ type: 'surge', cyl: 0, t: tAt, amp: clamp((pr0 - 1) / 1.2, 0.2, 1) });
+        }
+        boostPa *= 0.75 + 0.25 * Math.sin(this.surgeClock * Math.PI * 2);
+      } else this.surgeClock = 0;
+      if (!wasSurging && this.bovOpen && this.boostUp > 12000 && !this.bovFired) {
+        this.bovFired = true;
+        this.events.push({ type: 'bov', cyl: 0, t: tAt, amp: clamp(this.boostUp / 1.2e5, 0.2, 1.2) });
+      }
+      if (!this.bovOpen) this.bovFired = false;
+      this.boostUp += (boostPa - this.boostUp) * Math.min(1, h / 0.05);
+      pUp = PATM + this.boostUp;
+      // efficiency island sits around 60% of choke flow, falls off toward surge and choke
+      this.compEff = clamp(0.76 - 0.55 * (flowFrac - 0.6) ** 2 - 0.3 * chokeLoss, 0.45, 0.77);
+      this.compOutT = T_AMB * (1 + (Math.pow(pUp / PATM, 0.286) - 1) / this.compEff);
+      Tup = t.intercooler ? T_AMB + (this.compOutT - T_AMB) * 0.28 : this.compOutT;
+      // running way off the map overspeeds the wheel
+      const over = Math.max(0, flowFrac - 0.98) * 9 + Math.max(0, this.spool - 1.08) * 8;
+      if (over > 0 && this.spool > 0.7) this.turboOver += h * over;
+      else this.turboOver = Math.max(0, this.turboOver - h * 0.3);
+      if (this.turboOver > 1 && !this.failure) this.failTurbo();
     } else {
-      this.spool = 0;
+      this.spool = Math.max(0, this.spool - h * 2);
+      this.boostUp = 0;
+      this.surging = false;
+      this.compOutT = T_AMB;
     }
+    this.chargeT = Tup;
 
     // throttle plate and idle bypass
     const plate = 1 - Math.cos((this.throttle * Math.PI) / 2);
@@ -581,7 +685,14 @@ export class Engine {
     const tunedRpm = 1.9e6 / Math.max(80, t.runner);
     const ram = 1 + 0.07 * Math.exp(-(((rpm - tunedRpm) / (0.38 * tunedRpm)) ** 2));
 
-    const pExh = PATM * (1.02 + 0.15 * (this.exhFlowF / Math.max(1e-4, (1.18 * this.VdTotal * 6000) / 120)) ** 2) + (t.boost > 0 ? t.boost * 6894.76 * this.spool * 0.7 : 0);
+    let pExh = PATM * (1.02 + 0.15 * (this.exhFlowF / Math.max(1e-4, (1.18 * this.VdTotal * 6000) / 120)) ** 2);
+    if (t.turbo) {
+      // the turbine is a restriction. a small housing makes boost early and chokes the engine up top
+      const size = t.turboSize / 56;
+      const ratio = clamp(1.35 / Math.pow(size, 0.9) - 0.3, 0.55, 1.6);
+      pExh += this.boostUp * ratio + PATM * 0.04 * (this.exhFlowF / (0.16 * size * size)) ** 2;
+    }
+    this.emap = pExh;
     const Texh = 700;
 
     // valve float: past the float point the valves stop seating properly
@@ -622,6 +733,12 @@ export class Engine {
 
       // new cycle starts at overlap TDC
       if (crossed(0)) {
+        // head gasket (or rotary seals): every cycle over the limit eats a bit of it
+        const over = c.peakP / (t.pressureLimit * 1e5) - 1;
+        if (over > 0 && !c.dead) {
+          c.gasket += over * 0.04 + 0.004;
+          if (c.gasket >= 1 && !this.failure) this.fail('gasket', c.idx);
+        }
         c.peakPLast = c.peakP;
         c.peakP = 0;
         c.ca50Last = c.ca50;
@@ -659,7 +776,7 @@ export class Engine {
       const aEx = rot ? (this.portExMax * le) / 10 : curtain(this.dEx, le);
 
       // a holed piston just blows everything into the crankcase
-      const leak = c.dead && this.failure?.kind === 'piston' && this.failure.cyl === c.idx ? this.A * 0.05 : 0;
+      const leak = c.dead && this.failure?.cyl === c.idx ? (this.failure.kind === 'piston' ? this.A * 0.05 : this.failure.kind === 'gasket' ? this.A * 0.012 : 0) : 0;
 
       const p = c.p;
       const T = c.T;
@@ -692,7 +809,15 @@ export class Engine {
       dE -= dmLk > 0 ? CP * T * dmLk : CP * T_AMB * dmLk;
 
       let mAir = c.mAir;
-      mAir += dmIn > 0 ? dmIn : dmIn * airFrac;
+      if (dmIn > 0) {
+        // whatever got shoved up the runner during overlap is first back in
+        const back = Math.min(dmIn, c.revert);
+        c.revert -= back;
+        mAir += dmIn - back;
+      } else {
+        c.revert = Math.min(c.revert - dmIn * (1 - airFrac) * REVERT_KEEP, c.V * 2);
+        mAir += dmIn * airFrac;
+      }
       mAir -= dmEx > 0 ? dmEx * airFrac : 0;
       mAir -= dmLk > 0 ? dmLk * airFrac : -dmLk;
 
@@ -707,6 +832,11 @@ export class Engine {
       if (crossed(wrap720(this.win.exC - this.win.exD / 2))) {
         c.egt = T * 0.62;
         this.events.push({ type: 'exhaust', cyl: c.idx, t: tAt, amp: clamp((p - PATM) / 6e5, 0, 1.6) });
+        // raw mixture hits a header still hot from the other cylinders and goes off in the pipe
+        if (c.unburnt) {
+          c.unburnt = false;
+          if (Math.max(...this.cyls.map((k) => k.egt)) > 650 && Math.random() < 0.3) this.events.push({ type: 'pop', cyl: c.idx, t: tAt + 0.002, amp: 0.4 + Math.random() * 0.6 });
+        }
       }
 
       // spark
@@ -717,12 +847,25 @@ export class Engine {
         const air = c.mAir;
         const lambda = afrCmd / STOICH;
         c.lambda = lambda;
-        const misfire = this.fuelCut || this.killed.has(c.idx) || c.dead || lambda > 1.6 || air < 1e-7;
+        // exhaust left behind (overlap, low manifold pressure) dilutes the charge.
+        // past a point the flame gets slow and sloppy and some cycles never light.
+        // this is the lope of a big cam and most of a bridgeport's brap
+        const xr = c.m > 0 ? clamp(1 - air / c.m, 0, 1) : 0;
+        c.residual = xr;
+        const dil = Math.max(0, xr - (this.kind === 'rotary' ? 0.2 : 0.14));
+        const pMiss = this.kind === 'rotary' ? clamp((dil - 0.1) * 2.6, 0, 0.6) : clamp((dil - 0.12) * 1.6, 0, 0.5);
+        const fuelOn = !this.fuelCut && !this.killed.has(c.idx) && !c.dead && lambda <= 1.6 && air >= 1e-7;
+        const dilMiss = fuelOn && Math.random() < pMiss;
+        const misfire = !fuelOn || dilMiss;
+        if (dilMiss) c.unburnt = true;
         if (!misfire) {
           let eff: number;
           if (lambda <= 1) eff = 1 - 2.2 * (lambda - 0.87) ** 2;
           else eff = (1 - 2.2 * (1 - 0.87) ** 2) / lambda;
           c.Qtot = (air / STOICH) * LHV * 0.88 * Math.max(0.2, eff);
+          // cycle to cycle spread, tiny on a healthy charge, big on a diluted one
+          const cov = 0.025 + dil * 1.4;
+          c.Qtot *= clamp(1 - Math.random() * Math.random() * cov * 2.2 + (Math.random() - 0.5) * cov * 0.4, 0.1, 1.08);
           // rotary chambers are long and thin, the flame takes longer to cross
           const slow = this.kind === 'rotary' ? this.kN * 1.15 : 1;
           const delay = (8 + (rpm / 1000) * 1.5) * slow;
@@ -730,7 +873,7 @@ export class Engine {
           const rich = lambda < 0.8 ? (0.8 - lambda) * 40 : 0;
           const lowLoad = 0.5 * Math.max(0, 0.6 - this.pMan / PATM);
           c.burnStart = c.sparkAt + delay;
-          c.burnDur = (50 + (rpm / 1000) * 1.5 + lean + rich) * (1 + lowLoad) * slow;
+          c.burnDur = (50 + (rpm / 1000) * 1.5 + lean + rich) * (1 + lowLoad) * (1 + dil * 2.5) * slow;
           c.burning = true;
           c.xb = 0;
           c.knockInt = 0;
@@ -803,7 +946,7 @@ export class Engine {
 
     // manifold filling and emptying
     this.pMan += ((R * Tup) / this.Vman) * (mdotThr - mdotIntakeSum) * h;
-    this.pMan = clamp(this.pMan, 8000, PATM + t.boost * 6894.76 + 30000);
+    this.pMan = clamp(this.pMan, 8000, pUp + 30000);
 
     const k = Math.min(1, h * 6);
     this.exhFlowF += (Math.max(0, mdotExhSum) - this.exhFlowF) * k;
@@ -832,7 +975,7 @@ export class Engine {
       this.dynoBrake = clamp(err * 60 + this.dynoInt, 0, 4000);
       tLoad = this.dynoBrake * Math.tanh(omega / 5);
     } else {
-      const tRef = this.VdTotal * 1000 * 130 * (1 + t.boost / 14.7);
+      const tRef = this.VdTotal * 1000 * 130 * (1 + (t.turbo ? t.boost : 0) / 14.7);
       tLoad = this.load * tRef * clamp(rpm / 1500, 0, 1);
     }
 
@@ -914,6 +1057,23 @@ export class Engine {
       cranking: this.starter,
       idleValve: this.idleValve,
       spool: this.spool,
+      turbo: this.tune.turbo
+        ? {
+            shaftRpm: this.turboDead ? 0 : (this.spool * 165000) / (this.tune.turboSize / 56),
+            boost: this.boostUp,
+            pr: (PATM + this.boostUp) / PATM,
+            flow: this.airFlowF,
+            flowFrac: this.airFlowF / (0.42 * (this.tune.turboSize / 56) ** 2),
+            eff: this.compEff,
+            chargeT: this.chargeT,
+            compOutT: this.compOutT,
+            emap: this.emap,
+            surging: this.surging,
+            dead: this.turboDead,
+          }
+        : null,
+      peakBar: this.cyls.reduce((a, c) => Math.max(a, c.peakPLast), 0) / 1e5,
+      pressureLimit: this.tune.pressureLimit,
     };
   }
 }
